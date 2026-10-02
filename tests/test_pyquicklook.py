@@ -99,11 +99,34 @@ def test_mono_wav_is_i_only(tmp_path):
     src = pq.FileSource.from_wav(str(p), lambda fs: N)
     assert src.mono and src.data.shape == (N, 2)
     assert not np.any(src.data[:, 0])                  # Q = 0
-    _d, spec, scale = pq.process_block(src.data, np.hanning(N))
+    _d, spec, scale = pq.process_block(src.data, np.hanning(N), mono=True)
     assert scale == 1.0                                # nothing to balance against
-    # a real tone: equal halves at +f and -f, each 6 dB below the amplitude
-    assert level_at(spec, 1000) == pytest.approx(level_at(spec, -1000), abs=0.01)
-    assert level_at(spec, 1000) == pytest.approx(20 * np.log10(0.25), abs=0.05)
+    freqs = np.fft.rfftfreq(N, 1 / FS)
+    assert len(spec) == len(freqs)                     # one-sided
+    k = int(np.argmax(spec))
+    assert freqs[k] == 1000
+    assert spec[k] == pytest.approx(20 * np.log10(0.5), abs=0.05)   # amplitude 0.5
+
+
+@pytest.mark.parametrize("swap", [False, True])
+def test_mono_full_scale_sine_is_0dbfs(swap):
+    x = np.sin(2 * np.pi * 3000 * np.arange(N) / FS)
+    _d, spec, _s = pq.process_block(pq.mono_as_stereo(x), np.hanning(N),
+                                    swap_iq=swap, mono=True)
+    freqs = np.fft.rfftfreq(N, 1 / FS)
+    assert freqs[np.argmax(spec)] == 3000              # --swap-iq doesn't apply
+    assert spec.max() == pytest.approx(0.0, abs=0.05)
+
+
+def test_mono_display_is_one_sided():
+    ql = pq.QuickLook(FS, N, False, True, (-120, 0), 10, mono=True)
+    assert ql.ax_spec.get_xlim() == (0, FS / 2)
+    assert ql.freqs.min() == 0 and len(ql.line_spec.get_xdata()) == N // 2 + 1
+    ql.update([pq.mono_as_stereo(0.5 * np.cos(2 * np.pi * 2000 * np.arange(N) / FS))])
+    assert ql.peak_text.get_text() == "2000 Hz\n-6.0 dBFS"
+    assert ql.water[0].max() == pytest.approx(-6.0, abs=0.1)
+    assert "MONO INPUT" in ql.fig._suptitle.get_text()
+    assert [l.get_label() for l in ql.ax_time.get_lines()] == ["mono input"]
 
 
 def test_mono_as_stereo_shapes():

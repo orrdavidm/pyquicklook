@@ -11,8 +11,9 @@ playback path) and shown as:
                     strongest bin labelled
   * Waterfall     - spectrum history, sharing the spectrum's frequency axis
 
-A one-channel device (e.g. a laptop microphone) or mono .wav also works: it is
-shown as I with Q = 0, so its spectrum is mirrored, and a warning says so.
+A one-channel device (e.g. a laptop microphone) or mono .wav also works.  A
+real signal has the same content at +f and -f, so it gets a one-sided
+(0 .. fs/2) spectrum instead, and a warning says so.
 
 Processing per block mirrors the MATLAB script: remove DC, correct I/Q gain
 imbalance, Hann window, FFT, fftshift.  Block length is fs / resolution, so
@@ -62,9 +63,8 @@ def to_complex(stereo, swap_iq=False):
 
 def mono_as_stereo(x):
     """A one-channel signal as a (frames, 2) block with Q = 0 and I = the
-    signal, so a mono microphone can still be looked at.  Its spectrum is
-    mirrored (equal at +f and -f), since a real signal has no sign of
-    frequency."""
+    signal, so mono sources fit the same block format.  Process these with
+    ``mono=True``."""
     x = np.asarray(x).reshape(len(x), -1)[:, 0]
     return np.column_stack([np.zeros_like(x), x])
 
@@ -100,13 +100,36 @@ def spectrum_dbfs(d, window):
     return np.maximum(db, DB_FLOOR)
 
 
-def process_block(stereo, window, swap_iq=False, balance=True):
+def spectrum_real_dbfs(x, window):
+    """One-sided (0 .. fs/2) magnitude spectrum of a real signal in dBFS.
+
+    The negative-frequency half is the mirror image, so its energy is folded
+    in (x2): a full-scale sine reads 0 dBFS, as a complex tone does in
+    ``spectrum_dbfs``.  DC and Nyquist have no mirror and aren't doubled.
+    """
+    mag = 2 * np.abs(np.fft.rfft(x * window)) / np.sum(window)
+    mag[0] /= 2
+    if len(x) % 2 == 0:
+        mag[-1] /= 2
+    with np.errstate(divide="ignore"):
+        db = 20 * np.log10(mag)
+    return np.maximum(db, DB_FLOOR)
+
+
+def process_block(stereo, window, swap_iq=False, balance=True, mono=False):
     """Run one block through the MATLAB processing chain.
 
     Returns ``(time_signal, spectrum_db, i_scale)``.  As in MATLAB, the time
     signal is shown after DC removal but *before* I/Q balancing, so any
     imbalance is still visible in the time plot.
+
+    With ``mono=True`` the block comes from ``mono_as_stereo``: the real
+    signal in the I column gets a one-sided spectrum, and I/Q balance and
+    ``swap_iq`` don't apply.
     """
+    if mono:
+        x = remove_dc(stereo[:, 1].astype(np.float64))
+        return x + 0j, spectrum_real_dbfs(x, window), 1.0
     d = remove_dc(to_complex(stereo, swap_iq))
     balanced, scale = iq_balance(d) if balance else (d, 1.0)
     return d, spectrum_dbfs(balanced, window), scale
@@ -246,8 +269,13 @@ class QuickLook:
         self.swap_iq = swap_iq
         self.balance = balance
         self.window = np.hanning(block_size)
-        # Matches MATLAB's -fs/2 : res : fs/2-res for even block sizes
-        self.freqs = np.fft.fftshift(np.fft.fftfreq(block_size, d=1.0 / fs))
+        if mono:
+            # A real signal: 0 .. fs/2 only
+            self.freqs = np.fft.rfftfreq(block_size, d=1.0 / fs)
+        else:
+            # Matches MATLAB's -fs/2 : res : fs/2-res for even block sizes
+            self.freqs = np.fft.fftshift(np.fft.fftfreq(block_size, d=1.0 / fs))
+        nbins = len(self.freqs)
         self.blocks_seen = 0
         self.zero_blocks = 0     # consecutive all-zero blocks
 
@@ -261,8 +289,11 @@ class QuickLook:
         # ---- Time domain: I and Q overlaid ----
         t_ms = np.arange(block_size) / fs * 1e3
         zeros = np.zeros(block_size)
-        (self.line_i,) = self.ax_time.plot(t_ms, zeros, label="I (real)", lw=0.8)
+        (self.line_i,) = self.ax_time.plot(
+            t_ms, zeros, label="mono input" if mono else "I (real)", lw=0.8)
         (self.line_q,) = self.ax_time.plot(t_ms, zeros, label="Q (imag)", lw=0.8)
+        if mono:
+            self.line_q.remove()
         self.ax_time.set_xlim(0, t_ms[-1])
         self.ax_time.set_ylim(-1, 1)
         self.ax_time.set_xlabel("Time [ms]")
@@ -270,15 +301,15 @@ class QuickLook:
         self.ax_time.legend(loc="upper right")
         self.ax_time.grid(True, alpha=0.3)
 
-        # ---- Two-sided spectrum with peak marker ----
-        (self.line_spec,) = self.ax_spec.plot(self.freqs, np.full(block_size, DB_FLOOR), lw=0.8)
+        # ---- Spectrum (two-sided, or one-sided for mono) with peak marker ----
+        (self.line_spec,) = self.ax_spec.plot(self.freqs, np.full(nbins, DB_FLOOR), lw=0.8)
         (self.peak_dot,) = self.ax_spec.plot([], [], "o", color="C3", ms=5)
         self.peak_text = self.ax_spec.annotate(
             "", xy=(0, 0), xytext=(6, -4), textcoords="offset points",
             va="top", fontsize=9,
             bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.8),
         )
-        self.ax_spec.set_xlim(-fs / 2, fs / 2)
+        self.ax_spec.set_xlim(0 if mono else -fs / 2, fs / 2)
         self.ax_spec.set_ylim(*db_range)
         self.ax_spec.set_xlabel("Frequency [Hz]")
         self.ax_spec.set_ylabel("Magnitude [dBFS]")
@@ -289,8 +320,8 @@ class QuickLook:
         # columns (and the tones in them), so each row keeps the max of every
         # `pool` adjacent bins.
         df = fs / block_size
-        self.pool = -(-block_size // WATERFALL_MAX_COLS)
-        cols = block_size // self.pool
+        self.pool = -(-nbins // WATERFALL_MAX_COLS)
+        cols = nbins // self.pool
         self.water = np.full((history, cols), db_range[0])
         left = self.freqs[0] - df / 2
         self.im_water = self.ax_water.imshow(
@@ -320,7 +351,7 @@ class QuickLook:
 
     def _set_title(self, scale):
         if self.mono:
-            bal = "MONO INPUT: Q = 0, spectrum mirrored"
+            bal = "MONO INPUT: one-sided spectrum"
         elif self.balance:
             bal = f"I gain x{scale:.3f}"
         else:
@@ -338,7 +369,8 @@ class QuickLook:
         spec = None
         for block in blocks:
             self.zero_blocks = self.zero_blocks + 1 if not np.any(block) else 0
-            d, spec, scale = process_block(block, self.window, self.swap_iq, self.balance)
+            d, spec, scale = process_block(block, self.window, self.swap_iq,
+                                           self.balance, self.mono)
             self.water[1:] = self.water[:-1]
             cols = self.water.shape[1]
             self.water[0] = spec[:cols * self.pool].reshape(cols, self.pool).max(axis=1)
@@ -346,7 +378,8 @@ class QuickLook:
 
         # Only the newest block is drawn in the line plots
         self.line_i.set_ydata(d.real)
-        self.line_q.set_ydata(d.imag)
+        if not self.mono:
+            self.line_q.set_ydata(d.imag)
         self.line_spec.set_ydata(spec)
         self.im_water.set_data(self.water)
 
@@ -358,7 +391,8 @@ class QuickLook:
         self.peak_text.xy = (f_pk, y)
         self.peak_text.set_text(f"{f_pk:.0f} Hz\n{db_pk:.1f} dBFS")
         # Keep the label on-screen when the peak is near the right edge
-        right = f_pk > self.fs / 4
+        x0, x1 = self.ax_spec.get_xlim()
+        right = f_pk > x1 - (x1 - x0) / 4
         self.peak_text.set_ha("right" if right else "left")
         self.peak_text.set_position((-6 if right else 6, -4))
 
@@ -407,8 +441,8 @@ def _parse_args(argv=None):
     p.add_argument("--list", action="store_true",
                    help="list audio input devices and exit")
     p.add_argument("--file", default=None,
-                   help="play back a .wav (stereo: Q left, I right; mono is shown "
-                        "as I with Q = 0) instead of live capture")
+                   help="play back a .wav (stereo: Q left, I right; mono gets a "
+                        "one-sided spectrum) instead of live capture")
     p.add_argument("--swap-iq", action="store_true",
                    help="treat left as I and right as Q")
     p.add_argument("--no-iq-balance", action="store_true",
@@ -530,9 +564,10 @@ def main(argv=None):
             source = LiveSource(device, fs, n, channels)
             what = "the input device has only one channel"
         if source.mono:
-            print(f"Warning: {what}; showing it as I with Q = 0. The spectrum is "
-                  f"mirrored (+f and -f look the same) and I/Q balance is off. "
-                  f"Use a stereo line input for real I/Q.", file=sys.stderr)
+            print(f"Warning: {what}; showing a one-sided spectrum (0 to fs/2). One "
+                  f"channel can't tell +f from -f, so I/Q balance and --swap-iq "
+                  f"don't apply. Use a stereo line input for real I/Q.",
+                  file=sys.stderr)
     except Exception as e:                                      # noqa: BLE001
         print(f"Error: {e}", file=sys.stderr)
         return 1
