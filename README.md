@@ -67,6 +67,14 @@ pyquicklook --swap-iq
 pyquicklook --no-iq-balance
 ```
 
+**Mono inputs.** Real I/Q needs a stereo line input, but a one-channel device
+(such as a built-in or USB microphone) or a mono `.wav` still works, which is
+handy for trying pyquicklook out. The signal is shown as I with Q = 0, so the
+spectrum is mirrored (+f and −f look the same) and there's nothing for I/Q
+balance to correct. pyquicklook prints a warning and the plot title says
+**MONO INPUT**. When a `--device` substring matches both kinds, a stereo
+device is chosen.
+
 `--device` matches the name *or* the host API shown by `--list`. On Windows
 each card is listed once per host API (MME, DirectSound, WASAPI, WDM-KS), so
 `--device WASAPI` or `--device "X4 [Windows WASAPI]"` picks one. Matches that

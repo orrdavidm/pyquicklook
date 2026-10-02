@@ -11,6 +11,9 @@ playback path) and shown as:
                     strongest bin labelled
   * Waterfall     - spectrum history, sharing the spectrum's frequency axis
 
+A one-channel device (e.g. a laptop microphone) or mono .wav also works: it is
+shown as I with Q = 0, so its spectrum is mirrored, and a warning says so.
+
 Processing per block mirrors the MATLAB script: remove DC, correct I/Q gain
 imbalance, Hann window, FFT, fftshift.  Block length is fs / resolution, so
 ``--resolution`` is the FFT bin spacing just like MATLAB's
@@ -55,6 +58,15 @@ def to_complex(stereo, swap_iq=False):
     if swap_iq:
         left, right = right, left
     return right + 1j * left
+
+
+def mono_as_stereo(x):
+    """A one-channel signal as a (frames, 2) block with Q = 0 and I = the
+    signal, so a mono microphone can still be looked at.  Its spectrum is
+    mirrored (equal at +f and -f), since a real signal has no sign of
+    frequency."""
+    x = np.asarray(x).reshape(len(x), -1)[:, 0]
+    return np.column_stack([np.zeros_like(x), x])
 
 
 def remove_dc(d):
@@ -123,21 +135,23 @@ def _sounddevice():
 
 
 class LiveSource:
-    """Stereo blocks from a sound card via sounddevice.
+    """Stereo blocks from a sound card via sounddevice.  A one-channel
+    device (``channels=1``) is delivered as I with Q = 0.
 
     The audio callback runs in its own thread and pushes every block onto a
     queue, so the plot sees each block exactly once instead of sampling
     whatever block happens to be newest.
     """
 
-    def __init__(self, device, fs, block_size, max_queued=64):
+    def __init__(self, device, fs, block_size, channels=2, max_queued=64):
         sd = _sounddevice()
 
         self.q = queue.Queue(maxsize=max_queued)
         self.dropped = 0
+        self.mono = channels == 1
         self.stream = sd.InputStream(
             device=device,
-            channels=2,
+            channels=channels,
             samplerate=fs,
             blocksize=block_size,
             dtype="float32",
@@ -147,14 +161,15 @@ class LiveSource:
     def _callback(self, indata, frames, time_info, status):
         if status:
             print(status, file=sys.stderr)
+        block = mono_as_stereo(indata) if self.mono else indata.copy()
         try:
-            self.q.put_nowait(indata.copy())
+            self.q.put_nowait(block)
         except queue.Full:
             # Plotting can't keep up; drop the oldest block to stay current.
             self.dropped += 1
             try:
                 self.q.get_nowait()
-                self.q.put_nowait(indata.copy())
+                self.q.put_nowait(block)
             except (queue.Empty, queue.Full):
                 pass
 
@@ -175,10 +190,12 @@ class LiveSource:
 
 
 class FileSource:
-    """Stereo blocks from a .wav file, paced at real time and looped."""
+    """Stereo blocks from a .wav file, paced at real time and looped.  A mono
+    file is delivered as I with Q = 0."""
 
-    def __init__(self, data, fs, block_size):
+    def __init__(self, data, fs, block_size, mono=False):
         self.data = data
+        self.mono = mono
         self.fs = fs
         self.block_size = block_size
         self.n_blocks = len(data) // block_size
@@ -192,16 +209,15 @@ class FileSource:
         from scipy.io import wavfile
 
         fs, data = wavfile.read(path)
-        if data.ndim != 2 or data.shape[1] < 2:
-            raise ValueError(f"{path} must have 2 channels (Q left, I right)")
-        data = data[:, :2]
+        mono = data.ndim == 1 or data.shape[1] == 1
+        data = mono_as_stereo(data) if mono else data[:, :2]
         if data.dtype == np.uint8:
             data = (data.astype(np.float64) - 128) / 128
         elif np.issubdtype(data.dtype, np.integer):
             data = data.astype(np.float64) / (np.iinfo(data.dtype).max + 1)
         else:
             data = data.astype(np.float64)
-        return cls(data, fs, block_size_for_fs(fs))
+        return cls(data, fs, block_size_for_fs(fs), mono)
 
     def start(self):
         self.t0 = time.monotonic()
@@ -223,8 +239,9 @@ class FileSource:
 # Display
 # ---------------------------------------------------------------------------
 class QuickLook:
-    def __init__(self, fs, block_size, swap_iq, balance, db_range, history):
+    def __init__(self, fs, block_size, swap_iq, balance, db_range, history, mono=False):
         self.fs = fs
+        self.mono = mono
         self.n = block_size
         self.swap_iq = swap_iq
         self.balance = balance
@@ -302,7 +319,12 @@ class QuickLook:
         return self.zero_blocks * self.n / self.fs >= SILENCE_WARN_S
 
     def _set_title(self, scale):
-        bal = f"I gain x{scale:.3f}" if self.balance else "I/Q balance off"
+        if self.mono:
+            bal = "MONO INPUT: Q = 0, spectrum mirrored"
+        elif self.balance:
+            bal = f"I gain x{scale:.3f}"
+        else:
+            bal = "I/Q balance off"
         warn = "\nNO INPUT: the device is returning all zeros" if self.no_input else ""
         self.fig.suptitle(
             f"fs = {self.fs:g} Hz   N = {self.n}   "
@@ -385,7 +407,8 @@ def _parse_args(argv=None):
     p.add_argument("--list", action="store_true",
                    help="list audio input devices and exit")
     p.add_argument("--file", default=None,
-                   help="play back a stereo .wav (Q left, I right) instead of live capture")
+                   help="play back a .wav (stereo: Q left, I right; mono is shown "
+                        "as I with Q = 0) instead of live capture")
     p.add_argument("--swap-iq", action="store_true",
                    help="treat left as I and right as Q")
     p.add_argument("--no-iq-balance", action="store_true",
@@ -420,13 +443,15 @@ def _input_devices(sd):
 
 
 def _select_device(device_arg, fs):
-    """Resolve *device_arg* to a sounddevice index that supports 2-channel
-    input at *fs*.
+    """Resolve *device_arg* to ``(sounddevice index, channels)`` for input at
+    *fs*.
 
     A substring is matched against "name [host API]", so on Windows, where
     each device appears once per host API (MME, DirectSound, WASAPI, WDM-KS),
     "--device WASAPI" or "--device 'X4 [Windows WASAPI]'" can pick one.
-    Matches that can't do stereo at *fs* are skipped.
+    Matches that can't record at *fs* are skipped.  Any match that can record
+    stereo wins; otherwise a one-channel device (e.g. a laptop microphone) is
+    used with ``channels=1``.
     """
     sd = _sounddevice()
     if device_arg is None:
@@ -439,21 +464,24 @@ def _select_device(device_arg, fs):
                           if device_arg.lower() in f"{dev['name']} [{api}]".lower()]
             if not candidates:
                 raise ValueError(f"no input device matching '{device_arg}' (see --list)")
-    problems = []
-    for idx in candidates:
-        try:
-            sd.check_input_settings(device=idx, samplerate=fs, channels=2)
-            return idx
-        except Exception as e:                                  # noqa: BLE001
-            dev = sd.query_devices(idx, "input")
-            problems.append(f"  [{'default' if idx is None else idx}] {dev['name']}: "
-                            f"{dev['max_input_channels']} input ch, "
-                            f"{dev['default_samplerate']:g} Hz default ({e})")
+    problems = {}
+    for channels in (2, 1):
+        for idx in candidates:
+            try:
+                sd.check_input_settings(device=idx, samplerate=fs, channels=channels)
+                return idx, channels
+            except Exception as e:                              # noqa: BLE001
+                problems.setdefault(idx, e)
+    lines = []
+    for idx, e in problems.items():
+        dev = sd.query_devices(idx, "input")
+        lines.append(f"  [{'default' if idx is None else idx}] {dev['name']}: "
+                     f"{dev['max_input_channels']} input ch, "
+                     f"{dev['default_samplerate']:g} Hz default ({e})")
     raise ValueError(
-        f"no matching device can record 2 channels at {fs:g} Hz:\n"
-        + "\n".join(problems)
-        + "\npyquicklook needs a stereo line input; pick one with --list/--device, "
-          "or try --fs with the device's default rate"
+        f"no matching device can record at {fs:g} Hz:\n" + "\n".join(lines)
+        + "\npick another with --list/--device, or try --fs with the device's "
+          "default rate"
     )
 
 
@@ -494,10 +522,17 @@ def main(argv=None):
             fs, n = source.fs, source.block_size
             if fs != args.fs:
                 print(f"Using file sample rate {fs} Hz")
+            what = f"{args.file} is mono"
         else:
             fs = args.fs
             n = _block_size(fs, args.resolution)
-            source = LiveSource(_select_device(args.device, fs), fs, n)
+            device, channels = _select_device(args.device, fs)
+            source = LiveSource(device, fs, n, channels)
+            what = "the input device has only one channel"
+        if source.mono:
+            print(f"Warning: {what}; showing it as I with Q = 0. The spectrum is "
+                  f"mirrored (+f and -f look the same) and I/Q balance is off. "
+                  f"Use a stereo line input for real I/Q.", file=sys.stderr)
     except Exception as e:                                      # noqa: BLE001
         print(f"Error: {e}", file=sys.stderr)
         return 1
@@ -508,6 +543,7 @@ def main(argv=None):
         balance=not args.no_iq_balance,
         db_range=tuple(args.db_range),
         history=args.history,
+        mono=source.mono,
     )
     warned = []
 

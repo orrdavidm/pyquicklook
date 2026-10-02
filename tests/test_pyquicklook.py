@@ -92,11 +92,31 @@ def test_wav_formats(tmp_path, dtype, scale):
     assert np.abs(src.data).max() == pytest.approx(0.5, abs=0.01)
 
 
-def test_mono_wav_rejected(tmp_path):
+def test_mono_wav_is_i_only(tmp_path):
     p = tmp_path / "mono.wav"
-    wavfile.write(p, FS, np.zeros(N, np.int16))
-    with pytest.raises(ValueError, match="2 channels"):
-        pq.FileSource.from_wav(str(p), lambda fs: N)
+    wavfile.write(p, FS, (np.cos(2 * np.pi * 1000 * np.arange(N) / FS) * 16384)
+                  .astype(np.int16))
+    src = pq.FileSource.from_wav(str(p), lambda fs: N)
+    assert src.mono and src.data.shape == (N, 2)
+    assert not np.any(src.data[:, 0])                  # Q = 0
+    _d, spec, scale = pq.process_block(src.data, np.hanning(N))
+    assert scale == 1.0                                # nothing to balance against
+    # a real tone: equal halves at +f and -f, each 6 dB below the amplitude
+    assert level_at(spec, 1000) == pytest.approx(level_at(spec, -1000), abs=0.01)
+    assert level_at(spec, 1000) == pytest.approx(20 * np.log10(0.25), abs=0.05)
+
+
+def test_mono_as_stereo_shapes():
+    for x in (np.ones(8), np.ones((8, 1))):
+        st = pq.mono_as_stereo(x)
+        assert st.shape == (8, 2) and np.all(st[:, 0] == 0) and np.all(st[:, 1] == 1)
+
+
+def test_cli_mono_file_warns(tmp_path, capsys):
+    wav, png = tmp_path / "mono.wav", tmp_path / "out.png"
+    wavfile.write(wav, FS, np.tile(tone(1000)[:, 1], 4).astype(np.float32) * 0.5)
+    assert pq.main(["--file", str(wav), "--save", str(png), "--duration", "0.3"]) == 0
+    assert "is mono" in capsys.readouterr().err
 
 
 def test_cli_save(tmp_path, capsys):
@@ -153,20 +173,25 @@ def fake_sd(monkeypatch):
 
 
 def test_device_by_name_and_hostapi(fake_sd):
-    assert pq._select_device("blaster", 48000) == 1           # first that works
-    assert pq._select_device("wasapi", 48000) == 3
-    assert pq._select_device("3", 48000) == 3
+    assert pq._select_device("blaster", 48000) == (1, 2)      # first that works
+    assert pq._select_device("wasapi", 48000) == (3, 2)
+    assert pq._select_device("3", 48000) == (3, 2)
 
 
 def test_device_skips_unusable_matches(fake_sd):
-    assert pq._select_device("blaster", 44100) == 1
-    with pytest.raises(ValueError, match="2 channels at 44100"):
+    assert pq._select_device("blaster", 44100) == (1, 2)
+    with pytest.raises(ValueError, match="record at 44100"):
         pq._select_device("wasapi", 44100)
 
 
-def test_default_mono_mic_explained(fake_sd):
-    with pytest.raises(ValueError, match="stereo line input"):
-        pq._select_device(None, 48000)
+def test_mono_mic_used_with_one_channel(fake_sd):
+    assert pq._select_device(None, 48000) == (None, 1)        # default = mono mic
+    assert pq._select_device("realtek", 48000) == (0, 1)
+
+
+def test_stereo_preferred_over_mono(fake_sd):
+    # "MME" matches the mono mic first, but the stereo line in wins
+    assert pq._select_device("mme", 48000) == (1, 2)
 
 
 def test_list_devices(fake_sd, capsys):
