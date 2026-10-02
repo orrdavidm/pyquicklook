@@ -100,3 +100,7 @@ and Linux (`.github/workflows/tests.yml`).
 * Every captured block is processed, so the waterfall time axis is accurate.
   If plotting can't keep up, the oldest blocks are dropped and the number
   dropped is printed on exit.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
