@@ -169,6 +169,8 @@ class LiveSource:
     def __init__(self, device, fs, block_size, channels=2, max_queued=64):
         sd = _sounddevice()
 
+        self.fs = fs
+        self.block_size = block_size
         self.q = queue.Queue(maxsize=max_queued)
         self.dropped = 0
         self.mono = channels == 1
@@ -262,12 +264,15 @@ class FileSource:
 # Display
 # ---------------------------------------------------------------------------
 class QuickLook:
+    """The three-panel figure: time domain, spectrum with peak marker, and
+    waterfall.  Feed it blocks from a source with ``update()``."""
+
     def __init__(self, fs, block_size, swap_iq, balance, db_range, history, mono=False):
         self.fs = fs
-        self.mono = mono
         self.n = block_size
         self.swap_iq = swap_iq
         self.balance = balance
+        self.mono = mono
         self.window = np.hanning(block_size)
         if mono:
             # A real signal: 0 .. fs/2 only
@@ -275,7 +280,6 @@ class QuickLook:
         else:
             # Matches MATLAB's -fs/2 : res : fs/2-res for even block sizes
             self.freqs = np.fft.fftshift(np.fft.fftfreq(block_size, d=1.0 / fs))
-        nbins = len(self.freqs)
         self.blocks_seen = 0
         self.zero_blocks = 0     # consecutive all-zero blocks
 
@@ -285,46 +289,61 @@ class QuickLook:
         )
         if self.fig.canvas.manager is not None:
             self.fig.canvas.manager.set_window_title("pyquicklook")
+        self._setup_time_plot()
+        self._setup_spectrum(db_range)
+        self._setup_waterfall(db_range, history)
+        self._set_title(1.0)
+        self.fig.tight_layout()
 
-        # ---- Time domain: I and Q overlaid ----
-        t_ms = np.arange(block_size) / fs * 1e3
-        zeros = np.zeros(block_size)
-        (self.line_i,) = self.ax_time.plot(
-            t_ms, zeros, label="mono input" if mono else "I (real)", lw=0.8)
-        (self.line_q,) = self.ax_time.plot(t_ms, zeros, label="Q (imag)", lw=0.8)
-        if mono:
+    # ---- figure setup ------------------------------------------------------
+    def _setup_time_plot(self):
+        """I and Q overlaid (just the input for mono)."""
+        ax = self.ax_time
+        t_ms = np.arange(self.n) / self.fs * 1e3
+        zeros = np.zeros(self.n)
+        (self.line_i,) = ax.plot(
+            t_ms, zeros, label="mono input" if self.mono else "I (real)", lw=0.8)
+        (self.line_q,) = ax.plot(t_ms, zeros, label="Q (imag)", lw=0.8)
+        if self.mono:
             self.line_q.remove()
-        self.ax_time.set_xlim(0, t_ms[-1])
-        self.ax_time.set_ylim(-1, 1)
-        self.ax_time.set_xlabel("Time [ms]")
-        self.ax_time.set_ylabel("Amplitude")
-        self.ax_time.legend(loc="upper right")
-        self.ax_time.grid(True, alpha=0.3)
+        ax.set_xlim(0, t_ms[-1])
+        ax.set_ylim(-1, 1)
+        ax.set_xlabel("Time [ms]")
+        ax.set_ylabel("Amplitude")
+        ax.legend(loc="upper right")
+        ax.grid(True, alpha=0.3)
 
-        # ---- Spectrum (two-sided, or one-sided for mono) with peak marker ----
-        (self.line_spec,) = self.ax_spec.plot(self.freqs, np.full(nbins, DB_FLOOR), lw=0.8)
-        (self.peak_dot,) = self.ax_spec.plot([], [], "o", color="C3", ms=5)
-        self.peak_text = self.ax_spec.annotate(
+    def _setup_spectrum(self, db_range):
+        """Two-sided spectrum (one-sided for mono) with a peak marker."""
+        ax = self.ax_spec
+        (self.line_spec,) = ax.plot(self.freqs, np.full(len(self.freqs), DB_FLOOR), lw=0.8)
+        (self.peak_dot,) = ax.plot([], [], "o", color="C3", ms=5)
+        self.peak_text = ax.annotate(
             "", xy=(0, 0), xytext=(6, -4), textcoords="offset points",
             va="top", fontsize=9,
             bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.8),
         )
-        self.ax_spec.set_xlim(0 if mono else -fs / 2, fs / 2)
-        self.ax_spec.set_ylim(*db_range)
-        self.ax_spec.set_xlabel("Frequency [Hz]")
-        self.ax_spec.set_ylabel("Magnitude [dBFS]")
-        self.ax_spec.grid(True, alpha=0.3)
+        ax.set_xlim(0 if self.mono else -self.fs / 2, self.fs / 2)
+        ax.set_ylim(*db_range)
+        ax.set_xlabel("Frequency [Hz]")
+        ax.set_ylabel("Magnitude [dBFS]")
+        ax.grid(True, alpha=0.3)
 
-        # ---- Waterfall: newest row on top, frequency axis shared with spectrum ----
-        # Thousands of bins drawn into a few hundred pixels would skip most
-        # columns (and the tones in them), so each row keeps the max of every
-        # `pool` adjacent bins.
-        df = fs / block_size
+    def _setup_waterfall(self, db_range, history):
+        """Newest row on top, frequency axis shared with the spectrum.
+
+        Thousands of bins drawn into a few hundred pixels would skip most
+        columns (and the tones in them), so each row keeps the max of every
+        ``pool`` adjacent bins.
+        """
+        ax = self.ax_water
+        nbins = len(self.freqs)
+        df = self.fs / self.n
         self.pool = -(-nbins // WATERFALL_MAX_COLS)
         cols = nbins // self.pool
         self.water = np.full((history, cols), db_range[0])
         left = self.freqs[0] - df / 2
-        self.im_water = self.ax_water.imshow(
+        self.im_water = ax.imshow(
             self.water,
             aspect="auto",
             origin="upper",
@@ -334,20 +353,60 @@ class QuickLook:
             vmax=db_range[1],
             interpolation="nearest",
         )
-        self.ax_water.sharex(self.ax_spec)
-        self.ax_water.set_xlabel("Frequency [Hz]")
-        self.ax_water.set_ylabel("Blocks ago")
-        self.fig.colorbar(self.im_water, ax=self.ax_water, label="dBFS", pad=0.01)
+        ax.sharex(self.ax_spec)
+        ax.set_xlabel("Frequency [Hz]")
+        ax.set_ylabel("Blocks ago")
+        self.fig.colorbar(self.im_water, ax=ax, label="dBFS", pad=0.01)
 
-        self._set_title(1.0)
-        self.fig.tight_layout()
-
+    # ---- per-frame updates -------------------------------------------------
     @property
     def no_input(self):
         """True once the input has been exact digital zeros for a while: a
         real line input always has some noise, so this means the device is
         delivering nothing (e.g. macOS microphone permission not granted)."""
         return self.zero_blocks * self.n / self.fs >= SILENCE_WARN_S
+
+    def update(self, blocks):
+        """Process every new block into the waterfall, then redraw the line
+        plots, peak marker and title from the newest one."""
+        if not blocks:
+            return
+        for block in blocks:
+            d, spec, scale = self._process(block)
+        self.blocks_seen += len(blocks)
+
+        self.line_i.set_ydata(d.real)
+        if not self.mono:
+            self.line_q.set_ydata(d.imag)
+        self.line_spec.set_ydata(spec)
+        self.im_water.set_data(self.water)
+        self._mark_peak(spec)
+        self._set_title(scale)
+
+    def _process(self, block):
+        """One block: track silence, compute it, scroll it into the waterfall."""
+        self.zero_blocks = self.zero_blocks + 1 if not np.any(block) else 0
+        d, spec, scale = process_block(block, self.window, self.swap_iq,
+                                       self.balance, self.mono)
+        cols = self.water.shape[1]
+        self.water[1:] = self.water[:-1]
+        self.water[0] = spec[:cols * self.pool].reshape(cols, self.pool).max(axis=1)
+        return d, spec, scale
+
+    def _mark_peak(self, spec):
+        """Dot and "Hz / dBFS" label on the strongest bin."""
+        k = int(np.argmax(spec))
+        f_pk, db_pk = self.freqs[k], spec[k]
+        lo, hi = self.ax_spec.get_ylim()
+        y = min(max(db_pk, lo), hi)
+        self.peak_dot.set_data([f_pk], [y])
+        self.peak_text.xy = (f_pk, y)
+        self.peak_text.set_text(f"{f_pk:.0f} Hz\n{db_pk:.1f} dBFS")
+        # Keep the label on-screen when the peak is near the right edge
+        x0, x1 = self.ax_spec.get_xlim()
+        right = f_pk > x1 - (x1 - x0) / 4
+        self.peak_text.set_ha("right" if right else "left")
+        self.peak_text.set_position((-6 if right else 6, -4))
 
     def _set_title(self, scale):
         if self.mono:
@@ -362,41 +421,6 @@ class QuickLook:
             f"resolution = {self.fs / self.n:g} Hz   {bal}{warn}",
             color="C3" if warn else "black",
         )
-
-    def update(self, blocks):
-        if not blocks:
-            return
-        spec = None
-        for block in blocks:
-            self.zero_blocks = self.zero_blocks + 1 if not np.any(block) else 0
-            d, spec, scale = process_block(block, self.window, self.swap_iq,
-                                           self.balance, self.mono)
-            self.water[1:] = self.water[:-1]
-            cols = self.water.shape[1]
-            self.water[0] = spec[:cols * self.pool].reshape(cols, self.pool).max(axis=1)
-        self.blocks_seen += len(blocks)
-
-        # Only the newest block is drawn in the line plots
-        self.line_i.set_ydata(d.real)
-        if not self.mono:
-            self.line_q.set_ydata(d.imag)
-        self.line_spec.set_ydata(spec)
-        self.im_water.set_data(self.water)
-
-        k = int(np.argmax(spec))
-        f_pk, db_pk = self.freqs[k], spec[k]
-        lo, hi = self.ax_spec.get_ylim()
-        y = min(max(db_pk, lo), hi)
-        self.peak_dot.set_data([f_pk], [y])
-        self.peak_text.xy = (f_pk, y)
-        self.peak_text.set_text(f"{f_pk:.0f} Hz\n{db_pk:.1f} dBFS")
-        # Keep the label on-screen when the peak is near the right edge
-        x0, x1 = self.ax_spec.get_xlim()
-        right = f_pk > x1 - (x1 - x0) / 4
-        self.peak_text.set_ha("right" if right else "left")
-        self.peak_text.set_position((-6 if right else 6, -4))
-
-        self._set_title(scale)
 
 
 # ---------------------------------------------------------------------------
@@ -532,54 +556,41 @@ def _list_devices():
               f"{dev['max_input_channels']} ch, {dev['default_samplerate']:g} Hz default")
 
 
-def main(argv=None):
-    args = _parse_args(argv)
+def _check_gui(save):
+    """Use the windowless backend for --save; otherwise make sure matplotlib
+    found a GUI toolkit to open a window with."""
+    if save:
+        plt.switch_backend("Agg")
+    elif plt.get_backend().lower() in NON_INTERACTIVE:
+        raise RuntimeError(
+            f"matplotlib has no GUI toolkit to open a window with (backend "
+            f"'{plt.get_backend()}'); {_hint(GUI_HINT)}. "
+            f"Or use --save to write the plots to an image instead."
+        )
 
-    try:
-        if args.list:
-            _list_devices()
-            return 0
 
-        if args.save:
-            plt.switch_backend("Agg")
-        elif plt.get_backend().lower() in NON_INTERACTIVE:
-            raise RuntimeError(
-                f"matplotlib has no GUI toolkit to open a window with (backend "
-                f"'{plt.get_backend()}'); {_hint(GUI_HINT)}. "
-                f"Or use --save to write the plots to an image instead."
-            )
+def _open_source(args):
+    """The --file or sound-card source, with a warning if it is mono."""
+    if args.file:
+        source = FileSource.from_wav(args.file, lambda fs: _block_size(fs, args.resolution))
+        if source.fs != args.fs:
+            print(f"Using file sample rate {source.fs} Hz")
+        what = f"{args.file} is mono"
+    else:
+        n = _block_size(args.fs, args.resolution)
+        device, channels = _select_device(args.device, args.fs)
+        source = LiveSource(device, args.fs, n, channels)
+        what = "the input device has only one channel"
+    if source.mono:
+        print(f"Warning: {what}; showing a one-sided spectrum (0 to fs/2). One "
+              f"channel can't tell +f from -f, so I/Q balance and --swap-iq "
+              f"don't apply. Use a stereo line input for real I/Q.",
+              file=sys.stderr)
+    return source
 
-        if args.file:
-            source = FileSource.from_wav(
-                args.file, lambda fs: _block_size(fs, args.resolution)
-            )
-            fs, n = source.fs, source.block_size
-            if fs != args.fs:
-                print(f"Using file sample rate {fs} Hz")
-            what = f"{args.file} is mono"
-        else:
-            fs = args.fs
-            n = _block_size(fs, args.resolution)
-            device, channels = _select_device(args.device, fs)
-            source = LiveSource(device, fs, n, channels)
-            what = "the input device has only one channel"
-        if source.mono:
-            print(f"Warning: {what}; showing a one-sided spectrum (0 to fs/2). One "
-                  f"channel can't tell +f from -f, so I/Q balance and --swap-iq "
-                  f"don't apply. Use a stereo line input for real I/Q.",
-                  file=sys.stderr)
-    except Exception as e:                                      # noqa: BLE001
-        print(f"Error: {e}", file=sys.stderr)
-        return 1
 
-    ql = QuickLook(
-        fs, n,
-        swap_iq=args.swap_iq,
-        balance=not args.no_iq_balance,
-        db_range=tuple(args.db_range),
-        history=args.history,
-        mono=source.mono,
-    )
+def _run(ql, source, args):
+    """Feed the figure until the window closes, or for --duration with --save."""
     warned = []
 
     def frame(_frame=None):
@@ -611,6 +622,29 @@ def main(argv=None):
         if isinstance(source, LiveSource) and source.dropped:
             print(f"Note: {source.dropped} blocks dropped because plotting fell behind",
                   file=sys.stderr)
+
+
+def main(argv=None):
+    args = _parse_args(argv)
+    try:
+        if args.list:
+            _list_devices()
+            return 0
+        _check_gui(args.save)
+        source = _open_source(args)
+    except Exception as e:                                      # noqa: BLE001
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    ql = QuickLook(
+        source.fs, source.block_size,
+        swap_iq=args.swap_iq,
+        balance=not args.no_iq_balance,
+        db_range=tuple(args.db_range),
+        history=args.history,
+        mono=source.mono,
+    )
+    _run(ql, source, args)
     return 0
 
 
