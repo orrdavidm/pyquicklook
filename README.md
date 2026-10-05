@@ -19,14 +19,41 @@ MATLAB's `frequency_resolution` argument.
 
 ## Install
 
-Needs Python 3.10 or newer. It works on Windows, macOS and Linux.
+Needs Python 3.10 or newer. It works on Windows, macOS and Linux. Use
+`python3 -m pip` (or `py -m pip` on Windows) in place of `pip` below if `pip`
+belongs to a different Python than the one you run.
+
+**From GitHub (no clone or download needed):**
 
 ```bash
 pip install git+https://github.com/orrdavidm/pyquicklook
 ```
 
-or from a clone of this repository, `pip install .` (add `-e` to work on the
-code).
+This needs `git` installed. Add `@v0.2.0` (a release tag) or `@branch-name`
+to the end of the URL to install a particular version.
+
+**From a wheel file** (no `git` needed), e.g. one downloaded from the
+[Releases](https://github.com/orrdavidm/pyquicklook/releases) page or handed out
+in class:
+
+```bash
+pip install pyquicklook-0.2.0-py3-none-any.whl
+```
+
+pip also accepts the wheel's download URL in place of the file name. The same
+wheel works on every OS, and pip downloads numpy, matplotlib and the other
+dependencies itself.
+
+**From a clone of this repository:** `pip install .` (add `-e` to work on the
+code: edits take effect without reinstalling).
+
+**Updating.** Install again the same way. For a GitHub install, add
+`--force-reinstall --no-deps` so pip replaces the code even if the version
+number hasn't changed:
+
+```bash
+pip install --force-reinstall --no-deps git+https://github.com/orrdavidm/pyquicklook
+```
 
 | | Audio (PortAudio) | Plot window (Tk or Qt) |
 |---|---|---|
@@ -86,6 +113,39 @@ Other options are `--db-range MIN MAX` (default `-120 0`), `--history N`
 (waterfall depth in blocks), `--interval MS` (plot refresh time) and
 `--duration S` (capture time for `--save`). Close the window or press Ctrl+C
 to stop.
+
+## Building and sharing a wheel
+
+A wheel (`.whl`) is a ready-to-install package file. To make one for a
+release:
+
+1. Bump `version` in `setup.cfg`, so pip can tell the new release from the
+   old one.
+2. Build:
+
+   ```bash
+   pip install build
+   python -m build
+   ```
+
+   This writes `dist/pyquicklook-<version>-py3-none-any.whl`, plus a source
+   archive (`.tar.gz`). `dist/` is git-ignored.
+3. Share it. The simplest way is a GitHub release, which tags the commit and
+   attaches the files:
+
+   ```bash
+   gh release create v0.2.0 dist/* --title "pyquicklook 0.2.0" --notes "What changed"
+   ```
+
+   (Or on github.com: Releases → Draft a new release, then drag in the files.)
+   Students can then install the wheel by URL:
+
+   ```bash
+   pip install https://github.com/orrdavidm/pyquicklook/releases/download/v0.2.0/pyquicklook-0.2.0-py3-none-any.whl
+   ```
+
+   You can also post the `.whl` file on Canvas; students install it with
+   `pip install` and the file name.
 
 ## Tests
 
