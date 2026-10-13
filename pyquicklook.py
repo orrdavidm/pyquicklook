@@ -428,13 +428,17 @@ class QuickLook:
 # ---------------------------------------------------------------------------
 NON_INTERACTIVE = {"agg", "cairo", "pdf", "pgf", "ps", "svg", "template"}
 
+UV_TK_FIX = ("the simplest fix is to reinstall with uv's own Python, which "
+             "includes Tk: 'uv tool install --reinstall --managed-python "
+             "git+https://github.com/orrdavidm/pyquicklook'")
+
 GUI_HINT = {
-    "Linux": "install Tk ('sudo apt install python3-tk' or your distribution's "
-             "equivalent) or Qt ('pip install PyQt6')",
-    "Darwin": "use the python.org installer (includes Tk), or with Homebrew "
-              "'brew install python-tk', or 'pip install PyQt6'",
-    "Windows": "re-run the Python installer with 'tcl/tk and IDLE' ticked, "
-               "or 'pip install PyQt6'",
+    "Linux": UV_TK_FIX + "; or install Tk for this Python "
+             "('sudo apt install python3-tk' or your distribution's equivalent)",
+    "Darwin": UV_TK_FIX + "; or install Tk for this Python "
+              "(Homebrew: 'brew install python-tk')",
+    "Windows": UV_TK_FIX + "; or re-run the Python installer with 'tcl/tk and "
+               "IDLE' ticked",
 }
 
 SILENCE_HINT = {

@@ -19,51 +19,83 @@ MATLAB's `frequency_resolution` argument.
 
 ## Install
 
-Needs Python 3.10 or newer. It works on Windows, macOS and Linux. Use
-`python3 -m pip` (or `py -m pip` on Windows) in place of `pip` below if `pip`
-belongs to a different Python than the one you run.
+pyquicklook is a command-line app, so install it with **uv** (recommended) or
+**pipx**. Each gives the app its own private Python environment and puts the
+`pyquicklook` command on your PATH. A plain `pip install` into a Homebrew or
+apt-managed Python stops with an "externally-managed-environment" error; these
+tools avoid that. Works on Windows, macOS and Linux.
 
-**From GitHub (no clone or download needed):**
+### 1. Get uv (once)
 
-```bash
-pip install git+https://github.com/orrdavidm/pyquicklook
-```
+| | |
+|---|---|
+| **macOS** | `brew install uv` |
+| **Windows** | `winget install --id=astral-sh.uv -e` |
+| **Linux** | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
 
-This needs `git` installed. Add `@v0.2.0` (a release tag) or `@branch-name`
-to the end of the URL to install a particular version.
+Other ways to install it are in the [uv documentation](https://docs.astral.sh/uv/getting-started/installation/).
+Then run `uv tool update-shell` and open a new terminal, so the commands uv
+installs are on your PATH.
 
-**From a wheel file** (no `git` needed), e.g. one downloaded from the
-[Releases](https://github.com/orrdavidm/pyquicklook/releases) page or handed out
-in class:
+**Linux only:** the audio library comes from your distribution:
+`sudo apt install libportaudio2` (Fedora: `sudo dnf install portaudio`). On
+macOS and Windows it's included.
 
-```bash
-pip install pyquicklook-0.2.0-py3-none-any.whl
-```
-
-pip also accepts the wheel's download URL in place of the file name. The same
-wheel works on every OS, and pip downloads numpy, matplotlib and the other
-dependencies itself.
-
-**From a clone of this repository:** `pip install .` (add `-e` to work on the
-code: edits take effect without reinstalling).
-
-**Updating.** Install again the same way. For a GitHub install, add
-`--force-reinstall --no-deps` so pip replaces the code even if the version
-number hasn't changed:
+### 2. Install pyquicklook
 
 ```bash
-pip install --force-reinstall --no-deps git+https://github.com/orrdavidm/pyquicklook
+uv tool install --managed-python git+https://github.com/orrdavidm/pyquicklook
 ```
 
-| | Audio (PortAudio) | Plot window (Tk or Qt) |
-|---|---|---|
-| **Windows** | included in the `sounddevice` wheel | included with the python.org installer ("tcl/tk" option) |
-| **macOS** | included in the `sounddevice` wheel | python.org installer: included. Homebrew: `brew install python-tk` |
-| **Linux** | `sudo apt install libportaudio2` (Fedora: `portaudio`) | `sudo apt install python3-tk` |
+`--managed-python` makes uv use its own copy of Python (downloaded the first
+time). That copy includes Tk, the toolkit the plot window needs, so nothing
+else has to be installed for the window. Installing from GitHub needs `git`;
+add `@v0.2.0` (a release tag) to the end of the URL for a particular version.
 
-If Tk isn't available, `pip install "pyquicklook[qt] @ git+https://github.com/orrdavidm/pyquicklook"` installs Qt instead.
-When one of these pieces is missing, pyquicklook says which one and how to
-install it.
+Without `git`, install a release wheel instead, by URL from the
+[Releases](https://github.com/orrdavidm/pyquicklook/releases) page or from a
+downloaded `.whl` file:
+
+```bash
+uv tool install --managed-python https://github.com/orrdavidm/pyquicklook/releases/download/v0.2.0/pyquicklook-0.2.0-py3-none-any.whl
+```
+
+### Updating and removing
+
+```bash
+uv tool upgrade pyquicklook      # a GitHub install: fetches the latest code
+uv tool uninstall pyquicklook
+```
+
+For a wheel install, run the install command again with the new wheel and
+`--reinstall`.
+
+### Using pipx instead
+
+Get pipx: `brew install pipx` (macOS), `sudo apt install pipx`
+(Ubuntu/Debian) or `py -m pip install --user pipx` (Windows). Then run
+`pipx ensurepath` (Windows: `py -m pipx ensurepath`) and open a new terminal.
+
+```bash
+pipx install git+https://github.com/orrdavidm/pyquicklook
+pipx reinstall pyquicklook       # update: fetches the latest code
+pipx uninstall pyquicklook
+```
+
+Use `pipx reinstall` to update: `pipx upgrade` only acts when the version
+number changes, so it skips new commits. pipx runs the app with the Python
+pipx itself uses, so the plot window needs Tk for that Python:
+`brew install python-tk` (Homebrew), `sudo apt install python3-tk` (Ubuntu);
+the python.org installers include it.
+
+### Qt instead of Tk
+
+If you'd rather use Qt for the window:
+`uv tool install --managed-python --with PyQt6 git+https://github.com/orrdavidm/pyquicklook`,
+or with pipx, `pipx install "pyquicklook[qt] @ git+https://github.com/orrdavidm/pyquicklook"`.
+
+When the audio library or the window toolkit is missing, pyquicklook says
+which one and how to fix it.
 
 **macOS microphone permission.** The first time it records, macOS asks whether
 the terminal app may use the microphone. If that was refused, the recording is
@@ -124,8 +156,7 @@ release:
 2. Build:
 
    ```bash
-   pip install build
-   python -m build
+   uv build
    ```
 
    This writes `dist/pyquicklook-<version>-py3-none-any.whl`, plus a source
@@ -141,17 +172,21 @@ release:
    Students can then install the wheel by URL:
 
    ```bash
-   pip install https://github.com/orrdavidm/pyquicklook/releases/download/v0.2.0/pyquicklook-0.2.0-py3-none-any.whl
+   uv tool install --managed-python https://github.com/orrdavidm/pyquicklook/releases/download/v0.2.0/pyquicklook-0.2.0-py3-none-any.whl
    ```
 
-   You can also post the `.whl` file on Canvas; students install it with
-   `pip install` and the file name.
+   You can also post the `.whl` file on Canvas; students install it the same
+   way with the file name in place of the URL.
 
-## Tests
+## Working on the code
+
+From a clone of this repository, install your working copy as the
+`pyquicklook` command (edits take effect without reinstalling) and run the
+tests:
 
 ```bash
-pip install pytest
-pytest tests
+uv tool install --managed-python --editable .
+uv run --no-project --with-editable . --with pytest pytest tests
 ```
 
 The tests need no sound card and no display. CI runs them on Windows, macOS
