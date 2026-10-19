@@ -60,15 +60,36 @@ downloaded `.whl` file:
 uv tool install --managed-python https://github.com/orrdavidm/pyquicklook/releases/download/v0.2.1/pyquicklook-0.2.1-py3-none-any.whl
 ```
 
-### Updating and removing
+### Updating
+
+To see which version you have, run `uv tool list` (or `pipx list --short`).
+The newest release is at the top of the
+[Releases](https://github.com/orrdavidm/pyquicklook/releases) page.
+
+How to update depends on how you installed:
+
+| You installed from | To update |
+|---|---|
+| GitHub, with no `@` in the URL | `uv tool upgrade pyquicklook` (fetches the latest code from `main`) |
+| a release wheel, or GitHub with `@` a tag or branch | run the install command again with the new release and `--reinstall` (below) |
+
+`uv tool upgrade` only follows what you originally installed. A wheel or an
+`@v0.2.0` install stays where it is ("Nothing to upgrade"), and an `@branch`
+install fails with "Failed to upgrade pyquicklook" once that branch is
+deleted. Installing again moves you to whatever you give it, whatever you had
+before. For example, to the 0.2.1 release:
 
 ```bash
-uv tool upgrade pyquicklook      # a GitHub install: fetches the latest code
-uv tool uninstall pyquicklook
+uv tool install --reinstall --managed-python https://github.com/orrdavidm/pyquicklook/releases/download/v0.2.1/pyquicklook-0.2.1-py3-none-any.whl
 ```
 
-For a wheel install, run the install command again with the new wheel and
-`--reinstall`.
+or to the latest code (after which `uv tool upgrade` keeps it current):
+
+```bash
+uv tool install --reinstall --managed-python git+https://github.com/orrdavidm/pyquicklook
+```
+
+To remove pyquicklook: `uv tool uninstall pyquicklook`.
 
 ### Using pipx instead
 
