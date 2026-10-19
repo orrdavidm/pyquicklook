@@ -50,14 +50,14 @@ uv tool install --managed-python git+https://github.com/orrdavidm/pyquicklook
 `--managed-python` makes uv use its own copy of Python (downloaded the first
 time). That copy includes Tk, the toolkit the plot window needs, so nothing
 else has to be installed for the window. Installing from GitHub needs `git`;
-add `@v0.2.0` (a release tag) to the end of the URL for a particular version.
+add `@v0.2.1` (a release tag) to the end of the URL for a particular version.
 
 Without `git`, install a release wheel instead, by URL from the
 [Releases](https://github.com/orrdavidm/pyquicklook/releases) page or from a
 downloaded `.whl` file:
 
 ```bash
-uv tool install --managed-python https://github.com/orrdavidm/pyquicklook/releases/download/v0.2.0/pyquicklook-0.2.0-py3-none-any.whl
+uv tool install --managed-python https://github.com/orrdavidm/pyquicklook/releases/download/v0.2.1/pyquicklook-0.2.1-py3-none-any.whl
 ```
 
 ### Updating and removing
@@ -197,14 +197,14 @@ release:
    attaches the files:
 
    ```bash
-   gh release create v0.2.0 dist/* --title "pyquicklook 0.2.0" --notes "What changed"
+   gh release create v0.2.1 dist/* --title "pyquicklook 0.2.1" --notes "What changed"
    ```
 
    (Or on github.com: Releases → Draft a new release, then drag in the files.)
    Students can then install the wheel by URL:
 
    ```bash
-   uv tool install --managed-python https://github.com/orrdavidm/pyquicklook/releases/download/v0.2.0/pyquicklook-0.2.0-py3-none-any.whl
+   uv tool install --managed-python https://github.com/orrdavidm/pyquicklook/releases/download/v0.2.1/pyquicklook-0.2.1-py3-none-any.whl
    ```
 
    You can also post the `.whl` file on Canvas; students install it the same
