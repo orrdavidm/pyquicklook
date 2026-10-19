@@ -50,14 +50,14 @@ uv tool install --managed-python git+https://github.com/orrdavidm/pyquicklook
 `--managed-python` makes uv use its own copy of Python (downloaded the first
 time). That copy includes Tk, the toolkit the plot window needs, so nothing
 else has to be installed for the window. Installing from GitHub needs `git`;
-add `@v0.2.0` (a release tag) to the end of the URL for a particular version.
+add `@v0.2.1` (a release tag) to the end of the URL for a particular version.
 
 Without `git`, install a release wheel instead, by URL from the
 [Releases](https://github.com/orrdavidm/pyquicklook/releases) page or from a
 downloaded `.whl` file:
 
 ```bash
-uv tool install --managed-python https://github.com/orrdavidm/pyquicklook/releases/download/v0.2.0/pyquicklook-0.2.0-py3-none-any.whl
+uv tool install --managed-python https://github.com/orrdavidm/pyquicklook/releases/download/v0.2.1/pyquicklook-0.2.1-py3-none-any.whl
 ```
 
 ### Updating and removing
@@ -126,6 +126,36 @@ pyquicklook --swap-iq
 pyquicklook --no-iq-balance
 ```
 
+### Looking closely at the time plot
+
+The two rows of controls under the time plot work like a scope's front panel:
+
+* **Time span** zooms the time axis, from the whole block down to 16 samples
+  (a log slider), e.g. to look at single cycles of a sine wave for
+  discontinuities.
+* **Trigger level** sets the level, the **Trigger** button cycles
+  off / rise / fall, and **Src** picks the channel it watches (I or Q). Each
+  capture is then drawn with t = 0 at the first crossing (interpolated
+  between samples, with a little hysteresis so noise doesn't re-trigger), so
+  successive captures line up and a steady waveform stands still. If no edge
+  is found in a block, the plot free-runs and says so, like a scope in Auto
+  mode.
+* **Type a value** in the box next to a slider and press Enter to set it
+  exactly. Time span is in ms unless you give a unit: `2`, `500 us`,
+  `0.01 s` or `100 samples`. Trigger level is −1 to 1. Anything else is
+  ignored and the box shows the current value again.
+* **Reset** next to each slider puts it back where it started: the whole
+  block and level 0, or the values given on the command line.
+* **Pause** (or the space bar) freezes every plot. While paused, the
+  figure toolbar's zoom and pan tools work on any of the plots, the way
+  stopping `quicklook_complex.m` used to; press **Run** or space to continue.
+
+The same settings can be given on the command line, e.g. for `--save`:
+
+```bash
+pyquicklook --span 2 --trigger rise --trigger-level 0.1 --trigger-source I
+```
+
 **Mono inputs.** Real I/Q needs a stereo line input, but a one-channel device
 (such as a built-in or USB microphone) or a mono `.wav` still works, which is
 handy for trying pyquicklook out. One channel is a real signal, with the same
@@ -142,7 +172,9 @@ rate set in the Windows Sound control panel; MME and DirectSound accept any
 rate.
 
 Other options are `--db-range MIN MAX` (default `-120 0`), `--history N`
-(waterfall depth in blocks), `--interval MS` (plot refresh time) and
+(waterfall depth in blocks), `--interval MS` (shortest time between screen
+refreshes; pyquicklook refreshes less often if drawing is slow, so the window
+stays responsive) and
 `--duration S` (capture time for `--save`). Close the window or press Ctrl+C
 to stop.
 
@@ -165,14 +197,14 @@ release:
    attaches the files:
 
    ```bash
-   gh release create v0.2.0 dist/* --title "pyquicklook 0.2.0" --notes "What changed"
+   gh release create v0.2.1 dist/* --title "pyquicklook 0.2.1" --notes "What changed"
    ```
 
    (Or on github.com: Releases → Draft a new release, then drag in the files.)
    Students can then install the wheel by URL:
 
    ```bash
-   uv tool install --managed-python https://github.com/orrdavidm/pyquicklook/releases/download/v0.2.0/pyquicklook-0.2.0-py3-none-any.whl
+   uv tool install --managed-python https://github.com/orrdavidm/pyquicklook/releases/download/v0.2.1/pyquicklook-0.2.1-py3-none-any.whl
    ```
 
    You can also post the `.whl` file on Canvas; students install it the same
