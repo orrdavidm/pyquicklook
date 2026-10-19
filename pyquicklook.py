@@ -26,6 +26,11 @@ Improvements over the MATLAB version:
   * waterfall display, device selection, --swap-iq, and --file playback of a
     recorded .wav so the tool can be used without a sound card
 
+The time plot has scope-style controls: a span slider to zoom in (down to a
+few samples), and a trigger (rising/falling edge on I or Q at a set level) so
+successive captures line up.  Pause (button or space bar) freezes everything,
+so the figure's own zoom and pan tools can be used for a closer look.
+
 Close the plot window to stop.
 """
 
@@ -38,10 +43,14 @@ import time
 import matplotlib.animation as animation
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.widgets import Button, Slider
 
 DB_FLOOR = -140.0  # dBFS value used in place of log(0)
 WATERFALL_MAX_COLS = 512   # wider spectra are max-pooled so narrow tones stay visible
 SILENCE_WARN_S = 2.0       # this long of exact digital zeros means no input at all
+MIN_SPAN = 16              # narrowest time-plot span, in samples
+PRETRIGGER = 0.1           # fraction of the time-plot span shown before the trigger
+TRIGGER_HYSTERESIS = 0.05  # of the signal's peak-to-peak: noise rejection
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +142,40 @@ def process_block(stereo, window, swap_iq=False, balance=True, mono=False):
     d = remove_dc(to_complex(stereo, swap_iq))
     balanced, scale = iq_balance(d) if balance else (d, 1.0)
     return d, spectrum_dbfs(balanced, window), scale
+
+
+def find_trigger(x, level, edge="rise", start=0, stop=None, hysteresis=None):
+    """Where *x* first crosses *level* on a rising (or ``edge="fall"``)
+    edge, as a fractional sample index, or None.
+
+    Like a scope trigger with hysteresis: for a rising edge the signal must
+    first drop below ``level - hysteresis`` before a crossing counts, so noise
+    riding on a slow edge doesn't trigger again and again.  The default
+    hysteresis is ``TRIGGER_HYSTERESIS`` of the signal's peak-to-peak.  The
+    crossing is interpolated between samples so a steady waveform lines up
+    exactly from one capture to the next.  Only crossings at indices in
+    ``[start, stop)`` count.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    if edge == "fall":
+        x, level = -x, -level
+    if hysteresis is None:
+        hysteresis = TRIGGER_HYSTERESIS * np.ptp(x)
+    # -1 = armed (below the band), +1 = at/above the level, 0 = in between;
+    # the in-between samples keep whichever state came before them
+    state = np.zeros(len(x), dtype=np.int8)
+    state[x < level - hysteresis] = -1
+    state[x >= level] = 1
+    last = np.where(state != 0, np.arange(len(x)), 0)
+    np.maximum.accumulate(last, out=last)
+    held = state[last]
+    k = np.flatnonzero((held[:-1] == -1) & (held[1:] == 1)) + 1
+    k = k[(k >= max(start, 1)) & (k < (len(x) if stop is None else stop))]
+    if not len(k):
+        return None
+    k = int(k[0])
+    a, b = x[k - 1], x[k]            # a < level <= b
+    return k - 1 + (level - a) / (b - a)
 
 
 # ---------------------------------------------------------------------------
@@ -264,10 +307,16 @@ class FileSource:
 # Display
 # ---------------------------------------------------------------------------
 class QuickLook:
-    """The three-panel figure: time domain, spectrum with peak marker, and
-    waterfall.  Feed it blocks from a source with ``update()``."""
+    """The three-panel figure: time domain (with span, trigger and pause
+    controls), spectrum with peak marker, and waterfall.  Feed it blocks from
+    a source with ``update()``."""
 
-    def __init__(self, fs, block_size, swap_iq, balance, db_range, history, mono=False):
+    TRIGGER_MODES = ("off", "rise", "fall")
+    TRIGGER_LABELS = {"off": "Trigger: off", "rise": "Trigger: rise",
+                      "fall": "Trigger: fall"}
+
+    def __init__(self, fs, block_size, swap_iq, balance, db_range, history, mono=False,
+                 span_ms=None, trigger="off", trigger_level=0.0, trigger_source="I"):
         self.fs = fs
         self.n = block_size
         self.swap_iq = swap_iq
@@ -282,18 +331,28 @@ class QuickLook:
             self.freqs = np.fft.fftshift(np.fft.fftfreq(block_size, d=1.0 / fs))
         self.blocks_seen = 0
         self.zero_blocks = 0     # consecutive all-zero blocks
+        self.paused = False
+        self.last_d = np.zeros(block_size, dtype=complex)
+        self.trigger = trigger
+        self.trigger_level = trigger_level
+        self.trigger_source = "I" if mono else trigger_source
+        self.triggered = None    # None (trigger off), True, or False (no edge found)
 
-        self.fig, (self.ax_time, self.ax_spec, self.ax_water) = plt.subplots(
-            3, 1, figsize=(10, 9),
-            gridspec_kw={"height_ratios": [1, 1, 1.3]},
-        )
+        self.fig = plt.figure(figsize=(10, 10))
+        grid = self.fig.add_gridspec(4, 1, height_ratios=[1.15, 0.09, 1, 1.25],
+                                     left=0.08, right=0.97, top=0.93, bottom=0.05,
+                                     hspace=0.42)
+        self.ax_time = self.fig.add_subplot(grid[0])
+        self.ax_spec = self.fig.add_subplot(grid[2])
+        self.ax_water = self.fig.add_subplot(grid[3])
         if self.fig.canvas.manager is not None:
             self.fig.canvas.manager.set_window_title("pyquicklook")
         self._setup_time_plot()
+        self._setup_controls(grid[1], span_ms)
         self._setup_spectrum(db_range)
         self._setup_waterfall(db_range, history)
         self._set_title(1.0)
-        self.fig.tight_layout()
+        self._draw_time(self.last_d)
 
     # ---- figure setup ------------------------------------------------------
     def _setup_time_plot(self):
@@ -306,12 +365,47 @@ class QuickLook:
         (self.line_q,) = ax.plot(t_ms, zeros, label="Q (imag)", lw=0.8)
         if self.mono:
             self.line_q.remove()
-        ax.set_xlim(0, t_ms[-1])
+        # trigger level and trigger instant (t = 0) markers
+        self.trig_hline = ax.axhline(0, color="C3", lw=0.8, ls="--", alpha=0.7)
+        self.trig_vline = ax.axvline(0, color="C3", lw=0.8, ls=":", alpha=0.7)
         ax.set_ylim(-1, 1)
         ax.set_xlabel("Time [ms]")
         ax.set_ylabel("Amplitude")
         ax.legend(loc="upper right")
         ax.grid(True, alpha=0.3)
+
+    def _setup_controls(self, cell, span_ms):
+        """Span and level sliders, trigger mode/source buttons, pause."""
+        # sliders in columns 0 and 2; columns 1 and 3 are gaps that hold the
+        # slider readouts and the next slider's label
+        row = cell.subgridspec(1, 7, width_ratios=[2.6, 1.55, 2.4, 0.5, 1.25, 0.75, 0.8],
+                               wspace=0.08)
+        fig = self.fig
+        # Span: a log slider from MIN_SPAN samples to the whole block
+        self.span_lo = min(MIN_SPAN, self.n)
+        self.span_ax = fig.add_subplot(row[0])
+        self.span_slider = Slider(self.span_ax, "Span", 0.0, 1.0, valinit=1.0)
+        if span_ms is not None:
+            self.set_span_ms(span_ms)
+        self.span_slider.on_changed(lambda _v: self._controls_changed())
+
+        self.level_ax = fig.add_subplot(row[2])
+        self.level_slider = Slider(self.level_ax, "Level", -1.0, 1.0,
+                                   valinit=float(np.clip(self.trigger_level, -1, 1)),
+                                   valfmt="%+.2f")
+        self.level_slider.on_changed(self._level_changed)
+
+        self.trig_button = Button(fig.add_subplot(row[4]), self.TRIGGER_LABELS[self.trigger])
+        self.trig_button.on_clicked(self._cycle_trigger)
+        self.src_ax = fig.add_subplot(row[5])
+        self.src_button = Button(self.src_ax, f"Src: {self.trigger_source}")
+        self.src_button.on_clicked(self._toggle_source)
+        if self.mono:
+            self.src_ax.set_visible(False)
+        self.pause_button = Button(fig.add_subplot(row[6]), "Pause")
+        self.pause_button.on_clicked(lambda _e: self.toggle_pause())
+        fig.canvas.mpl_connect("key_press_event", self._key)
+        self._update_span_text()
 
     def _setup_spectrum(self, db_range):
         """Two-sided spectrum (one-sided for mono) with a peak marker."""
@@ -358,6 +452,98 @@ class QuickLook:
         ax.set_ylabel("Blocks ago")
         self.fig.colorbar(self.im_water, ax=ax, label="dBFS", pad=0.01)
 
+    # ---- time-plot controls ------------------------------------------------
+    @property
+    def span_samples(self):
+        """Time-plot span from the log slider: MIN_SPAN .. block length."""
+        lo, hi = self.span_lo, self.n
+        return int(round(lo * (hi / lo) ** self.span_slider.val))
+
+    def set_span_ms(self, ms):
+        lo, hi = self.span_lo, self.n
+        samples = min(max(ms * 1e-3 * self.fs, lo), hi)
+        self.span_slider.set_val(np.log(samples / lo) / np.log(hi / lo) if hi > lo else 1.0)
+
+    def _update_span_text(self):
+        ms = self.span_samples / self.fs * 1e3
+        self.span_slider.valtext.set_text(
+            f"{ms:.3g} ms ({self.span_samples})" if ms < 10 else f"{ms:.0f} ms")
+
+    def _level_changed(self, value):
+        self.trigger_level = value
+        self._controls_changed()
+
+    def _cycle_trigger(self, _event=None):
+        modes = self.TRIGGER_MODES
+        self.trigger = modes[(modes.index(self.trigger) + 1) % len(modes)]
+        self.trig_button.label.set_text(self.TRIGGER_LABELS[self.trigger])
+        self._controls_changed()
+
+    def _toggle_source(self, _event=None):
+        if not self.mono:
+            self.trigger_source = "Q" if self.trigger_source == "I" else "I"
+            self.src_button.label.set_text(f"Src: {self.trigger_source}")
+            self._controls_changed()
+
+    def toggle_pause(self):
+        """Freeze or resume the whole display.  While frozen, the figure's
+        zoom and pan tools work on every plot, as after stopping the MATLAB
+        script."""
+        self.paused = not self.paused
+        self.pause_button.label.set_text("Run" if self.paused else "Pause")
+        self._set_title(self.last_scale)
+        self.fig.canvas.draw_idle()
+
+    def _key(self, event):
+        if event.key == " ":
+            self.toggle_pause()
+
+    def _controls_changed(self):
+        """Redraw the time plot from the newest block, so the controls work
+        while paused too."""
+        self._update_span_text()
+        self._draw_time(self.last_d)
+        self.fig.canvas.draw_idle()
+
+    def _draw_time(self, d):
+        """Plot *d* with t = 0 at the trigger point (if any), over the span."""
+        span = self.span_samples
+        pre = int(round(PRETRIGGER * span))
+        t0 = 0.0
+        self.triggered = None
+        if self.trigger != "off":
+            sig = d.real if self.trigger_source == "I" else d.imag
+            # Prefer a trigger that leaves the whole span inside the block; for
+            # wide spans accept one in the first half (the right end of the
+            # plot is then empty, as on a scope)
+            k = find_trigger(sig, self.trigger_level, self.trigger, start=pre,
+                             stop=max(self.n - (span - pre) + 1, self.n // 2))
+            self.triggered = k is not None
+            if k is not None:
+                t0 = k / self.fs
+        t_ms = (np.arange(self.n) / self.fs - t0) * 1e3
+        self.line_i.set_data(t_ms, d.real)
+        if not self.mono:
+            self.line_q.set_data(t_ms, d.imag)
+        span_ms = span / self.fs * 1e3
+        lo = -pre / self.fs * 1e3 if self.triggered else 0.0
+        self.ax_time.set_xlim(lo, lo + span_ms)
+
+        on = self.trigger != "off"
+        self.trig_hline.set_visible(on)
+        self.trig_hline.set_ydata([self.trigger_level] * 2)
+        self.trig_vline.set_visible(bool(self.triggered))
+        if not on:
+            state = "free running"
+        elif self.triggered:
+            state = (f"triggered on {self.trigger_source} "
+                     f"{'rising' if self.trigger == 'rise' else 'falling'} "
+                     f"through {self.trigger_level:+.2f}")
+        else:
+            state = "no trigger edge in this block: free running"
+        self.ax_time.set_title(state, fontsize=9, loc="left",
+                               color="black" if self.triggered is not False else "C3")
+
     # ---- per-frame updates -------------------------------------------------
     @property
     def no_input(self):
@@ -369,15 +555,14 @@ class QuickLook:
     def update(self, blocks):
         """Process every new block into the waterfall, then redraw the line
         plots, peak marker and title from the newest one."""
-        if not blocks:
+        if not blocks or self.paused:
             return
         for block in blocks:
             d, spec, scale = self._process(block)
         self.blocks_seen += len(blocks)
+        self.last_d = d
 
-        self.line_i.set_ydata(d.real)
-        if not self.mono:
-            self.line_q.set_ydata(d.imag)
+        self._draw_time(d)
         self.line_spec.set_ydata(spec)
         self.im_water.set_data(self.water)
         self._mark_peak(spec)
@@ -409,6 +594,7 @@ class QuickLook:
         self.peak_text.set_position((-6 if right else 6, -4))
 
     def _set_title(self, scale):
+        self.last_scale = scale
         if self.mono:
             bal = "MONO INPUT: one-sided spectrum"
         elif self.balance:
@@ -416,10 +602,12 @@ class QuickLook:
         else:
             bal = "I/Q balance off"
         warn = "\nNO INPUT: the device is returning all zeros" if self.no_input else ""
+        paused = ("\nPAUSED: zoom/pan with the toolbar; Run or space bar to resume"
+                  if self.paused else "")
         self.fig.suptitle(
             f"fs = {self.fs:g} Hz   N = {self.n}   "
-            f"resolution = {self.fs / self.n:g} Hz   {bal}{warn}",
-            color="C3" if warn else "black",
+            f"resolution = {self.fs / self.n:g} Hz   {bal}{warn}{paused}",
+            color="C3" if warn or paused else "black",
         )
 
 
@@ -481,6 +669,15 @@ def _parse_args(argv=None):
                    help="waterfall depth in blocks (default: 100)")
     p.add_argument("--interval", type=int, default=30,
                    help="plot refresh interval in ms (default: 30)")
+    p.add_argument("--span", type=float, default=None, metavar="MS",
+                   help="time-plot span in ms (default: the whole block); also a "
+                        "slider in the window")
+    p.add_argument("--trigger", choices=("off", "rise", "fall"), default="off",
+                   help="time-plot trigger edge (default: off); also a button")
+    p.add_argument("--trigger-level", type=float, default=0.0, metavar="LEVEL",
+                   help="trigger level, -1 .. 1 (default: 0); also a slider")
+    p.add_argument("--trigger-source", choices=("I", "Q"), default="I",
+                   help="channel the trigger watches (default: I); also a button")
     p.add_argument("--save", metavar="IMAGE", default=None,
                    help="run without a window for --duration seconds, then save the "
                         "plots to IMAGE (.png, .pdf, .svg) and exit")
@@ -647,6 +844,10 @@ def main(argv=None):
         db_range=tuple(args.db_range),
         history=args.history,
         mono=source.mono,
+        span_ms=args.span,
+        trigger=args.trigger,
+        trigger_level=args.trigger_level,
+        trigger_source=args.trigger_source,
     )
     _run(ql, source, args)
     return 0

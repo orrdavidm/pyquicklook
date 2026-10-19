@@ -126,7 +126,7 @@ def test_mono_display_is_one_sided():
     assert ql.peak_text.get_text() == "2000 Hz\n-6.0 dBFS"
     assert ql.water[0].max() == pytest.approx(-6.0, abs=0.1)
     assert "MONO INPUT" in ql.fig._suptitle.get_text()
-    assert [l.get_label() for l in ql.ax_time.get_lines()] == ["mono input"]
+    assert [t.get_text() for t in ql.ax_time.get_legend().get_texts()] == ["mono input"]
 
 
 def test_mono_as_stereo_shapes():
@@ -223,3 +223,115 @@ def test_list_devices(fake_sd, capsys):
     assert "*[0] Microphone (Realtek) [MME]" in out
     assert "[3] Line In (Sound Blaster X4) [Windows WASAPI]" in out
     assert "Speakers" not in out
+
+
+# ---- time plot: trigger, span, pause -----------------------------------------
+def test_trigger_interpolates_between_samples():
+    # sin crosses 0.3 rising at t = asin(0.3)/w + phase offset
+    f, phase = 1000.0, 0.37
+    n = np.arange(N)
+    x = np.sin(2 * np.pi * f * n / FS + phase)
+    k = pq.find_trigger(x, 0.3, "rise")
+    expected = (np.arcsin(0.3) - phase) * FS / (2 * np.pi * f)
+    expected += FS / f if expected < 0 else 0          # first crossing after 0
+    assert k == pytest.approx(expected, abs=0.01)       # sub-sample accurate
+
+
+def test_trigger_falling_edge():
+    x = np.cos(2 * np.pi * 1000 * np.arange(N) / FS)    # falls through 0 at 1/4 cycle
+    assert pq.find_trigger(x, 0.0, "fall") == pytest.approx(FS / 1000 / 4, abs=0.01)
+
+
+def test_trigger_hysteresis_ignores_noise_on_a_slow_edge():
+    rng = np.random.default_rng(0)
+    ramp = np.linspace(-1, 1, N) + rng.normal(0, 0.01, N)
+    first = pq.find_trigger(ramp, 0.0, "rise")
+    assert first == pytest.approx(N / 2, abs=40)
+    # without hysteresis the noise re-triggers just after the first crossing;
+    # with it, nothing else counts until the ramp ends
+    assert pq.find_trigger(ramp, 0.0, "rise", start=int(first) + 2,
+                           hysteresis=0.0) is not None
+    assert pq.find_trigger(ramp, 0.0, "rise", start=int(first) + 2) is None
+
+
+def test_trigger_none_and_window():
+    x = np.sin(2 * np.pi * 1000 * np.arange(N) / FS)
+    assert pq.find_trigger(0.5 * x, 0.8) is None        # level above the signal
+    k = pq.find_trigger(x, 0.0, start=100)
+    assert k >= 100
+    assert pq.find_trigger(x, 0.0, start=100, stop=101) is None
+
+
+def ql_with(**kw):
+    return pq.QuickLook(FS, N, False, True, (-120, 0), 10, **kw)
+
+
+def test_span_slider_sets_time_axis():
+    ql = ql_with()
+    assert ql.ax_time.get_xlim() == pytest.approx((0, N / FS * 1e3))     # whole block
+    ql.set_span_ms(2.0)
+    assert ql.span_samples == 96
+    assert ql.ax_time.get_xlim() == pytest.approx((0, 2.0))
+    ql.set_span_ms(0.0001)                                               # clamped
+    assert ql.span_samples == pq.MIN_SPAN
+
+
+def test_triggered_captures_line_up():
+    ql = ql_with(span_ms=2.0, trigger="rise", trigger_level=0.25)
+    for start in (0, 7, 123):                           # different phases each block
+        t = (np.arange(N) + start) / FS
+        ql.update([0.5 * np.column_stack([np.sin(2e3 * np.pi * t),
+                                          np.cos(2e3 * np.pi * t)])])
+        x, y = ql.line_i.get_data()
+        assert ql.triggered
+        assert np.interp(0.0, x, y) == pytest.approx(0.25, abs=1e-3)
+    lo, hi = ql.ax_time.get_xlim()
+    assert lo == pytest.approx(-pq.PRETRIGGER * 2.0, abs=0.03) and hi - lo == pytest.approx(2.0)
+
+
+def test_trigger_on_q_and_no_edge():
+    ql = ql_with(span_ms=2.0, trigger="fall", trigger_level=0.0, trigger_source="Q")
+    ql.update([tone(1000, i_amp=0.5, q_amp=0.5)])
+    x, y = ql.line_q.get_data()
+    assert ql.triggered and np.interp(0.0, x, y) == pytest.approx(0.0, abs=1e-3)
+    ql.level_slider.set_val(0.9)                         # above the signal
+    assert ql.triggered is False
+    assert "free running" in ql.ax_time.get_title(loc="left")
+    assert ql.ax_time.get_xlim()[0] == 0
+
+
+def test_buttons_cycle():
+    ql = ql_with()
+    ql._cycle_trigger()
+    assert ql.trigger == "rise" and ql.trig_button.label.get_text() == "Trigger: rise"
+    ql._cycle_trigger(), ql._cycle_trigger()
+    assert ql.trigger == "off"
+    ql._toggle_source()
+    assert ql.trigger_source == "Q"
+    mono = ql_with(mono=True)
+    mono._toggle_source()
+    assert mono.trigger_source == "I" and not mono.src_ax.get_visible()
+
+
+def test_pause_freezes_display():
+    ql = ql_with()
+    ql.update([tone(1000)])
+    ql.toggle_pause()
+    assert "PAUSED" in ql.fig._suptitle.get_text()
+    before = ql.line_spec.get_ydata().copy()
+    ql.update([tone(3000)])
+    assert ql.blocks_seen == 1 and np.array_equal(ql.line_spec.get_ydata(), before)
+    ql.set_span_ms(1.0)                                  # controls still work paused
+    assert ql.ax_time.get_xlim()[1] == pytest.approx(1.0)
+    ql.toggle_pause()
+    ql.update([tone(3000)])
+    assert ql.blocks_seen == 2 and "PAUSED" not in ql.fig._suptitle.get_text()
+
+
+def test_cli_trigger_options(tmp_path):
+    wav, png = tmp_path / "in.wav", tmp_path / "out.png"
+    wavfile.write(wav, FS, (np.tile(tone(1000) * 0.5, (4, 1)) * 32767).astype(np.int16))
+    assert pq.main(["--file", str(wav), "--save", str(png), "--duration", "0.3",
+                    "--span", "1.5", "--trigger", "rise", "--trigger-level", "0.1",
+                    "--trigger-source", "Q"]) == 0
+    assert png.stat().st_size > 10000
