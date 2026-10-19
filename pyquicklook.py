@@ -338,10 +338,10 @@ class QuickLook:
         self.trigger_source = "I" if mono else trigger_source
         self.triggered = None    # None (trigger off), True, or False (no edge found)
 
-        self.fig = plt.figure(figsize=(10, 10))
-        grid = self.fig.add_gridspec(4, 1, height_ratios=[1.15, 0.09, 1, 1.25],
+        self.fig = plt.figure(figsize=(10, 10.5))
+        grid = self.fig.add_gridspec(4, 1, height_ratios=[1.15, 0.22, 1, 1.25],
                                      left=0.08, right=0.97, top=0.93, bottom=0.05,
-                                     hspace=0.42)
+                                     hspace=0.4)
         self.ax_time = self.fig.add_subplot(grid[0])
         self.ax_spec = self.fig.add_subplot(grid[2])
         self.ax_water = self.fig.add_subplot(grid[3])
@@ -375,35 +375,49 @@ class QuickLook:
         ax.grid(True, alpha=0.3)
 
     def _setup_controls(self, cell, span_ms):
-        """Span and level sliders, trigger mode/source buttons, pause."""
-        # sliders in columns 0 and 2; columns 1 and 3 are gaps that hold the
-        # slider readouts and the next slider's label
-        row = cell.subgridspec(1, 7, width_ratios=[2.6, 1.55, 2.4, 0.5, 1.25, 0.75, 0.8],
-                               wspace=0.08)
+        """Two rows under the time plot:
+
+            Time span      [slider]  readout  [Reset]          [Pause]
+            Trigger level  [slider]  readout  [Reset]  [Trigger: off] [Src: I]
+
+        Reset puts a slider back where it started (the command-line value, or
+        the whole block / 0 by default)."""
+        # column 0 holds each slider's name, column 2 its readout
+        rows = cell.subgridspec(2, 7, width_ratios=[1.05, 4.2, 1.25, 0.75, 0.25, 1.25, 0.8],
+                                wspace=0.08, hspace=0.6)
         fig = self.fig
-        # Span: a log slider from MIN_SPAN samples to the whole block
+
+        # Time span: a log slider from MIN_SPAN samples to the whole block
         self.span_lo = min(MIN_SPAN, self.n)
-        self.span_ax = fig.add_subplot(row[0])
-        self.span_slider = Slider(self.span_ax, "Span", 0.0, 1.0, valinit=1.0)
+        self.span_ax = fig.add_subplot(rows[0, 1])
+        self.span_slider = Slider(self.span_ax, "Time span", 0.0, 1.0, valinit=1.0)
         if span_ms is not None:
             self.set_span_ms(span_ms)
+        self.span_reset_val = self.span_slider.val
         self.span_slider.on_changed(lambda _v: self._controls_changed())
+        self.span_reset = Button(fig.add_subplot(rows[0, 3]), "Reset")
+        self.span_reset.on_clicked(lambda _e: self.reset_span())
+        self.pause_button = Button(fig.add_subplot(rows[0, 5:]), "Pause")
+        self.pause_button.on_clicked(lambda _e: self.toggle_pause())
 
-        self.level_ax = fig.add_subplot(row[2])
-        self.level_slider = Slider(self.level_ax, "Level", -1.0, 1.0,
-                                   valinit=float(np.clip(self.trigger_level, -1, 1)),
-                                   valfmt="%+.2f")
+        # Trigger level, mode and source
+        self.level_ax = fig.add_subplot(rows[1, 1])
+        self.level_reset_val = float(np.clip(self.trigger_level, -1, 1))
+        self.level_slider = Slider(self.level_ax, "Trigger level", -1.0, 1.0,
+                                   valinit=self.level_reset_val, valfmt="%+.2f")
         self.level_slider.on_changed(self._level_changed)
-
-        self.trig_button = Button(fig.add_subplot(row[4]), self.TRIGGER_LABELS[self.trigger])
+        self.level_reset = Button(fig.add_subplot(rows[1, 3]), "Reset")
+        self.level_reset.on_clicked(lambda _e: self.reset_level())
+        self.trig_button = Button(fig.add_subplot(rows[1, 5]), self.TRIGGER_LABELS[self.trigger])
         self.trig_button.on_clicked(self._cycle_trigger)
-        self.src_ax = fig.add_subplot(row[5])
+        self.src_ax = fig.add_subplot(rows[1, 6])
         self.src_button = Button(self.src_ax, f"Src: {self.trigger_source}")
         self.src_button.on_clicked(self._toggle_source)
         if self.mono:
             self.src_ax.set_visible(False)
-        self.pause_button = Button(fig.add_subplot(row[6]), "Pause")
-        self.pause_button.on_clicked(lambda _e: self.toggle_pause())
+
+        for slider in (self.span_slider, self.level_slider):
+            slider.label.set_fontsize(10)
         fig.canvas.mpl_connect("key_press_event", self._key)
         self._update_span_text()
 
@@ -463,6 +477,14 @@ class QuickLook:
         lo, hi = self.span_lo, self.n
         samples = min(max(ms * 1e-3 * self.fs, lo), hi)
         self.span_slider.set_val(np.log(samples / lo) / np.log(hi / lo) if hi > lo else 1.0)
+
+    def reset_span(self):
+        """Back to the starting span (--span, or the whole block)."""
+        self.span_slider.set_val(self.span_reset_val)
+
+    def reset_level(self):
+        """Back to the starting trigger level (--trigger-level, or 0)."""
+        self.level_slider.set_val(self.level_reset_val)
 
     def _update_span_text(self):
         ms = self.span_samples / self.fs * 1e3

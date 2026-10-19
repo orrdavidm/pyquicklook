@@ -335,3 +335,20 @@ def test_cli_trigger_options(tmp_path):
                     "--span", "1.5", "--trigger", "rise", "--trigger-level", "0.1",
                     "--trigger-source", "Q"]) == 0
     assert png.stat().st_size > 10000
+
+
+def test_reset_buttons_restore_starting_values():
+    ql = ql_with()                                      # defaults: whole block, level 0
+    ql.set_span_ms(1.0)
+    ql.level_slider.set_val(0.6)
+    ql.reset_span()
+    ql.reset_level()
+    assert ql.span_samples == N and ql.trigger_level == 0.0
+    assert ql.ax_time.get_xlim() == pytest.approx((0, N / FS * 1e3))
+
+    cli = ql_with(span_ms=3.0, trigger_level=-0.25)     # command-line values
+    cli.set_span_ms(50.0)
+    cli.level_slider.set_val(0.9)
+    cli.reset_span()
+    cli.reset_level()
+    assert cli.span_samples == 144 and cli.trigger_level == -0.25

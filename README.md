@@ -128,17 +128,20 @@ pyquicklook --no-iq-balance
 
 ### Looking closely at the time plot
 
-The strip under the time plot works like a scope's front panel:
+The two rows of controls under the time plot work like a scope's front panel:
 
-* **Span** zooms the time axis, from the whole block down to 16 samples (a
-  log slider), e.g. to look at single cycles of a sine wave for
+* **Time span** zooms the time axis, from the whole block down to 16 samples
+  (a log slider), e.g. to look at single cycles of a sine wave for
   discontinuities.
-* **Trigger** cycles off / rise / fall, **Level** sets the trigger level and
-  **Src** picks the channel it watches (I or Q). Each capture is then drawn
-  with t = 0 at the first crossing (interpolated between samples, with a
-  little hysteresis so noise doesn't re-trigger), so successive captures line
-  up and a steady waveform stands still. If no edge is found in a block, the
-  plot free-runs and says so, like a scope in Auto mode.
+* **Trigger level** sets the level, the **Trigger** button cycles
+  off / rise / fall, and **Src** picks the channel it watches (I or Q). Each
+  capture is then drawn with t = 0 at the first crossing (interpolated
+  between samples, with a little hysteresis so noise doesn't re-trigger), so
+  successive captures line up and a steady waveform stands still. If no edge
+  is found in a block, the plot free-runs and says so, like a scope in Auto
+  mode.
+* **Reset** next to each slider puts it back where it started: the whole
+  block and level 0, or the values given on the command line.
 * **Pause** (or the space bar) freezes every plot. While paused, the
   figure toolbar's zoom and pan tools work on any of the plots, the way
   stopping `quicklook_complex.m` used to; press **Run** or space to continue.
