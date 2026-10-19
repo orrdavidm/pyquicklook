@@ -140,6 +140,10 @@ The two rows of controls under the time plot work like a scope's front panel:
   successive captures line up and a steady waveform stands still. If no edge
   is found in a block, the plot free-runs and says so, like a scope in Auto
   mode.
+* **Type a value** in the box next to a slider and press Enter to set it
+  exactly. Time span is in ms unless you give a unit: `2`, `500 us`,
+  `0.01 s` or `100 samples`. Trigger level is −1 to 1. Anything else is
+  ignored and the box shows the current value again.
 * **Reset** next to each slider puts it back where it started: the whole
   block and level 0, or the values given on the command line.
 * **Pause** (or the space bar) freezes every plot. While paused, the
@@ -168,7 +172,9 @@ rate set in the Windows Sound control panel; MME and DirectSound accept any
 rate.
 
 Other options are `--db-range MIN MAX` (default `-120 0`), `--history N`
-(waterfall depth in blocks), `--interval MS` (plot refresh time) and
+(waterfall depth in blocks), `--interval MS` (shortest time between screen
+refreshes; pyquicklook refreshes less often if drawing is slow, so the window
+stays responsive) and
 `--duration S` (capture time for `--save`). Close the window or press Ctrl+C
 to stop.
 

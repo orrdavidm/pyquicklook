@@ -37,13 +37,13 @@ Close the plot window to stop.
 import argparse
 import platform
 import queue
+import re
 import sys
 import time
 
-import matplotlib.animation as animation
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.widgets import Button, Slider
+from matplotlib.widgets import Button, Slider, TextBox
 
 DB_FLOOR = -140.0  # dBFS value used in place of log(0)
 WATERFALL_MAX_COLS = 512   # wider spectra are max-pooled so narrow tones stay visible
@@ -51,6 +51,7 @@ SILENCE_WARN_S = 2.0       # this long of exact digital zeros means no input at 
 MIN_SPAN = 16              # narrowest time-plot span, in samples
 PRETRIGGER = 0.1           # fraction of the time-plot span shown before the trigger
 TRIGGER_HYSTERESIS = 0.05  # of the signal's peak-to-peak: noise rejection
+REDRAW_DUTY = 0.5          # at most this fraction of the time goes to redrawing
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +177,38 @@ def find_trigger(x, level, edge="rise", start=0, stop=None, hysteresis=None):
     k = int(k[0])
     a, b = x[k - 1], x[k]            # a < level <= b
     return k - 1 + (level - a) / (b - a)
+
+
+_NUMBER_UNIT = re.compile(r"^\s*([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)\s*([a-zA-Zµ]*)")
+_SPAN_UNITS_MS = {"": 1.0, "ms": 1.0, "us": 1e-3, "µs": 1e-3, "s": 1e3}
+_SAMPLE_UNITS = ("sa", "sample", "samples", "smp")
+
+
+def parse_span_ms(text, fs):
+    """A typed time span in ms: "2", "2 ms", "500 us", "0.01 s" or
+    "100 samples".  Anything after the number and unit, such as the
+    "(106)" the readout shows, is ignored.  None if it isn't a positive
+    span."""
+    m = _NUMBER_UNIT.match(text)
+    if not m:
+        return None
+    value, unit = float(m.group(1)), m.group(2).lower()
+    if unit in _SAMPLE_UNITS:
+        ms = value / fs * 1e3
+    elif unit in _SPAN_UNITS_MS:
+        ms = value * _SPAN_UNITS_MS[unit]
+    else:
+        return None
+    return ms if ms > 0 else None
+
+
+def parse_level(text):
+    """A typed trigger level, -1 .. 1, or None."""
+    m = _NUMBER_UNIT.match(text)
+    if not m or m.group(2):
+        return None
+    value = float(m.group(1))
+    return value if -1.0 <= value <= 1.0 else None
 
 
 # ---------------------------------------------------------------------------
@@ -337,6 +370,9 @@ class QuickLook:
         self.trigger_level = trigger_level
         self.trigger_source = "I" if mono else trigger_source
         self.triggered = None    # None (trigger off), True, or False (no edge found)
+        self.blitting = False    # see enable_blitting()
+        self._background = None
+        self._needs_full_draw = False
 
         self.fig = plt.figure(figsize=(10, 10.5))
         grid = self.fig.add_gridspec(4, 1, height_ratios=[1.15, 0.22, 1, 1.25],
@@ -380,9 +416,10 @@ class QuickLook:
             Time span      [slider]  readout  [Reset]          [Pause]
             Trigger level  [slider]  readout  [Reset]  [Trigger: off] [Src: I]
 
-        Reset puts a slider back where it started (the command-line value, or
-        the whole block / 0 by default)."""
-        # column 0 holds each slider's name, column 2 its readout
+        The readouts are text boxes: type a value and press Enter to set the
+        slider.  Reset puts a slider back where it started (the command-line
+        value, or the whole block / 0 by default)."""
+        # column 0 holds each slider's name, column 2 its readout box
         rows = cell.subgridspec(2, 7, width_ratios=[1.05, 4.2, 1.25, 0.75, 0.25, 1.25, 0.8],
                                 wspace=0.08, hspace=0.6)
         fig = self.fig
@@ -395,6 +432,8 @@ class QuickLook:
             self.set_span_ms(span_ms)
         self.span_reset_val = self.span_slider.val
         self.span_slider.on_changed(lambda _v: self._controls_changed())
+        self.span_box = TextBox(fig.add_subplot(rows[0, 2]), "", textalignment="center")
+        self.span_box.on_submit(self._span_typed)
         self.span_reset = Button(fig.add_subplot(rows[0, 3]), "Reset")
         self.span_reset.on_clicked(lambda _e: self.reset_span())
         self.pause_button = Button(fig.add_subplot(rows[0, 5:]), "Pause")
@@ -406,6 +445,8 @@ class QuickLook:
         self.level_slider = Slider(self.level_ax, "Trigger level", -1.0, 1.0,
                                    valinit=self.level_reset_val, valfmt="%+.2f")
         self.level_slider.on_changed(self._level_changed)
+        self.level_box = TextBox(fig.add_subplot(rows[1, 2]), "", textalignment="center")
+        self.level_box.on_submit(self._level_typed)
         self.level_reset = Button(fig.add_subplot(rows[1, 3]), "Reset")
         self.level_reset.on_clicked(lambda _e: self.reset_level())
         self.trig_button = Button(fig.add_subplot(rows[1, 5]), self.TRIGGER_LABELS[self.trigger])
@@ -418,8 +459,9 @@ class QuickLook:
 
         for slider in (self.span_slider, self.level_slider):
             slider.label.set_fontsize(10)
+            slider.valtext.set_visible(False)      # the text boxes show the value
         fig.canvas.mpl_connect("key_press_event", self._key)
-        self._update_span_text()
+        self._sync_boxes()
 
     def _setup_spectrum(self, db_range):
         """Two-sided spectrum (one-sided for mono) with a peak marker."""
@@ -486,10 +528,41 @@ class QuickLook:
         """Back to the starting trigger level (--trigger-level, or 0)."""
         self.level_slider.set_val(self.level_reset_val)
 
-    def _update_span_text(self):
+    def _sync_boxes(self):
+        """Show the slider values in the text boxes, without firing their
+        submit events, and leaving alone a box that is being typed in."""
         ms = self.span_samples / self.fs * 1e3
-        self.span_slider.valtext.set_text(
-            f"{ms:.3g} ms ({self.span_samples})" if ms < 10 else f"{ms:.0f} ms")
+        span = f"{ms:.3g} ms ({self.span_samples})" if ms < 10 else f"{ms:.0f} ms"
+        for box, text in ((self.span_box, span),
+                          (self.level_box, f"{self.trigger_level:+.2f}")):
+            if not box.capturekeystrokes:
+                box.eventson = False
+                box.set_val(text)
+                box.eventson = True
+
+    @staticmethod
+    def _finish_typing(box):
+        """End editing after Enter (matplotlib keeps the box in typing mode)
+        without submitting a second time, so the box can show the value."""
+        box.eventson = False
+        box.stop_typing()
+        box.eventson = True
+
+    def _span_typed(self, text):
+        self._finish_typing(self.span_box)
+        ms = parse_span_ms(text, self.fs)
+        if ms is None:
+            self._sync_boxes()                    # not understood: show the current value
+        else:
+            self.set_span_ms(ms)                  # moves the slider, which redraws
+
+    def _level_typed(self, text):
+        self._finish_typing(self.level_box)
+        level = parse_level(text)
+        if level is None:
+            self._sync_boxes()
+        else:
+            self.level_slider.set_val(level)
 
     def _level_changed(self, value):
         self.trigger_level = value
@@ -517,14 +590,15 @@ class QuickLook:
         self.fig.canvas.draw_idle()
 
     def _key(self, event):
-        if event.key == " ":
+        typing = self.span_box.capturekeystrokes or self.level_box.capturekeystrokes
+        if event.key == " " and not typing:
             self.toggle_pause()
 
     def _controls_changed(self):
         """Redraw the time plot from the newest block, so the controls work
         while paused too."""
-        self._update_span_text()
         self._draw_time(self.last_d)
+        self._sync_boxes()
         self.fig.canvas.draw_idle()
 
     def _draw_time(self, d):
@@ -549,7 +623,9 @@ class QuickLook:
             self.line_q.set_data(t_ms, d.imag)
         span_ms = span / self.fs * 1e3
         lo = -pre / self.fs * 1e3 if self.triggered else 0.0
-        self.ax_time.set_xlim(lo, lo + span_ms)
+        if self.ax_time.get_xlim() != (lo, lo + span_ms):
+            self.ax_time.set_xlim(lo, lo + span_ms)
+            self._needs_full_draw = True      # the tick labels change
 
         on = self.trigger != "off"
         self.trig_hline.set_visible(on)
@@ -578,7 +654,7 @@ class QuickLook:
         """Process every new block into the waterfall, then redraw the line
         plots, peak marker and title from the newest one."""
         if not blocks or self.paused:
-            return
+            return False
         for block in blocks:
             d, spec, scale = self._process(block)
         self.blocks_seen += len(blocks)
@@ -589,6 +665,78 @@ class QuickLook:
         self.im_water.set_data(self.water)
         self._mark_peak(spec)
         self._set_title(scale)
+        return True
+
+    # ---- fast redrawing (blitting) -----------------------------------------
+    def _dynamic_artists(self):
+        """Everything that changes from frame to frame."""
+        artists = [self.line_i, self.trig_hline, self.trig_vline, self.line_spec,
+                   self.peak_dot, self.peak_text, self.im_water,
+                   self.fig._suptitle, self.ax_time._left_title]
+        return artists if self.mono else artists + [self.line_q]
+
+    def enable_blitting(self):
+        """Redraw only what changes each frame.
+
+        A full redraw re-renders every axis, tick label and control, which
+        is slow.  Instead the unchanging background is drawn once and saved;
+        each frame pastes it back and draws only the traces, spectrum,
+        waterfall, peak label and titles on top.  A full redraw still
+        happens when the background itself changes (a resize, the toolbar,
+        a control, or a new time-axis range), and the background is saved
+        again then.  Returns False if this backend can't blit.
+        """
+        canvas = self.fig.canvas
+        if not getattr(canvas, "supports_blit", False):
+            return False
+        self.blitting = True
+        for artist in self._dynamic_artists():
+            artist.set_animated(True)
+        canvas.mpl_connect("draw_event", self._full_draw_done)
+        # matplotlib leaves animated artists out of saved images; put them
+        # back in for the toolbar's save button
+        figure_savefig = self.fig.savefig
+
+        def savefig(*args, **kwargs):
+            artists = self._dynamic_artists()
+            for artist in artists:
+                artist.set_animated(False)
+            try:
+                return figure_savefig(*args, **kwargs)
+            finally:
+                for artist in artists:
+                    artist.set_animated(True)
+        self.fig.savefig = savefig
+        return True
+
+    def _full_draw_done(self, _event=None):
+        """After a full redraw (which skips the dynamic artists): save the
+        background, then draw the dynamic artists on top."""
+        if (not self.blitting or not self._dynamic_artists()[0].get_animated()
+                or not getattr(self.fig.canvas, "supports_blit", False)):
+            return                       # a save in progress, or the window is closed
+        self._background = self.fig.canvas.copy_from_bbox(self.fig.bbox)
+        # Draw them into the image only: the full redraw that called us puts
+        # the image on screen itself (blitting from here would make Qt repaint
+        # recursively)
+        self._draw_dynamic(blit=False)
+
+    def _draw_dynamic(self, blit=True):
+        for artist in self._dynamic_artists():
+            self.fig.draw_artist(artist)
+        if blit:
+            self.fig.canvas.blit(self.fig.bbox)
+
+    def refresh(self):
+        """Put the latest update on screen.  Returns True if that was a fast
+        blit (done now), False if a full redraw was requested."""
+        if self.blitting and self._background is not None and not self._needs_full_draw:
+            self.fig.canvas.restore_region(self._background)
+            self._draw_dynamic()
+            return True
+        self._needs_full_draw = False
+        self.fig.canvas.draw_idle()
+        return False
 
     def _process(self, block):
         """One block: track silence, compute it, scroll it into the waterfall."""
@@ -812,12 +960,55 @@ def _open_source(args):
     return source
 
 
+class RedrawPacer:
+    """Keeps redrawing from taking all the time.
+
+    A full redraw can take longer than ``--interval`` (100+ ms, more on a
+    slow machine or a high-resolution screen).  The window would then be busy
+    100% of the time, clicks and typing would wait, and the desktop would
+    report it as not responding.  This measures each redraw and stretches the
+    animation interval so redrawing uses at most ``REDRAW_DUTY`` of the time.
+    Every audio block is still processed; only the screen refreshes less
+    often.
+    """
+
+    def __init__(self, min_interval_ms):
+        self.min_interval = min_interval_ms
+        self.cost_ms = 0.0            # smoothed time from frame start to drawn
+        self.t0 = None
+        self.timer = None             # the animation's timer, once it exists
+
+    def frame_started(self):
+        self.t0 = time.perf_counter()
+
+    def drawn(self, _event=None):
+        if self.t0 is None:           # a redraw from a control, not a frame
+            return
+        ms = (time.perf_counter() - self.t0) * 1e3
+        self.t0 = None
+        self.cost_ms = ms if self.cost_ms == 0 else 0.8 * self.cost_ms + 0.2 * ms
+        if self.timer is not None:
+            self.timer.interval = self.interval
+
+    @property
+    def interval(self):
+        return int(max(self.min_interval, self.cost_ms / REDRAW_DUTY))
+
+
 def _run(ql, source, args):
     """Feed the figure until the window closes, or for --duration with --save."""
     warned = []
+    pacer = RedrawPacer(args.interval)
 
     def frame(_frame=None):
-        ql.update(source.poll())
+        if pacer.timer is not None and not plt.fignum_exists(ql.fig.number):
+            pacer.timer.stop()           # the window is gone (closed by hand or in code)
+            return
+        pacer.frame_started()
+        if not ql.update(source.poll()):
+            pacer.t0 = None              # nothing new (or paused): nothing to time
+        elif not args.save and ql.refresh():
+            pacer.drawn()                # a blit is done now; a full redraw reports later
         if ql.no_input and not warned:
             warned.append(True)
             print(f"Warning: the input is all zeros; {_hint(SILENCE_HINT)}",
@@ -833,10 +1024,12 @@ def _run(ql, source, args):
             ql.fig.savefig(args.save, dpi=100)
             print(f"Saved {args.save}")
         else:
-            ani = animation.FuncAnimation(  # noqa: F841 (must stay referenced)
-                ql.fig, frame, interval=args.interval,
-                blit=False, cache_frame_data=False,
-            )
+            ql.enable_blitting()
+            timer = ql.fig.canvas.new_timer(interval=args.interval)
+            timer.add_callback(frame)
+            pacer.timer = timer
+            ql.fig.canvas.mpl_connect("draw_event", pacer.drawn)
+            timer.start()
             plt.show()
     except KeyboardInterrupt:
         pass

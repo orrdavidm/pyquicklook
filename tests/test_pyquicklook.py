@@ -352,3 +352,71 @@ def test_reset_buttons_restore_starting_values():
     cli.reset_span()
     cli.reset_level()
     assert cli.span_samples == 144 and cli.trigger_level == -0.25
+
+
+# ---- typed values, fast redraw, pacing -------------------------------------
+@pytest.mark.parametrize("text,ms", [("2", 2.0), ("2.5 ms", 2.5), ("500 us", 0.5),
+                                     ("0.01 s", 10.0), ("96 samples", 2.0),
+                                     ("2.08 ms (100)", 2.08), (" 3ms", 3.0)])
+def test_parse_span(text, ms):
+    assert pq.parse_span_ms(text, FS) == pytest.approx(ms)
+
+
+@pytest.mark.parametrize("text", ["", "banana", "-2", "0", "5 parsecs"])
+def test_parse_span_rejects(text):
+    assert pq.parse_span_ms(text, FS) is None
+
+
+def test_parse_level():
+    assert pq.parse_level("+0.20") == 0.2 and pq.parse_level("-1") == -1.0
+    for bad in ("", "7", "-1.5", "0.2 V", "x"):
+        assert pq.parse_level(bad) is None
+
+
+def test_typed_values_set_sliders():
+    ql = ql_with()
+    ql._span_typed("2.5")
+    assert ql.span_samples == 120 and ql.span_box.text == "2.5 ms (120)"
+    ql._span_typed("banana")                            # ignored, box shows the value
+    assert ql.span_samples == 120 and ql.span_box.text == "2.5 ms (120)"
+    ql._level_typed("-0.35")
+    assert ql.trigger_level == pytest.approx(-0.35) and ql.level_box.text == "-0.35"
+    ql._level_typed("7")
+    assert ql.trigger_level == pytest.approx(-0.35) and ql.level_box.text == "-0.35"
+    ql.level_slider.set_val(0.5)                        # dragging updates the box
+    assert ql.level_box.text == "+0.50"
+
+
+def test_blitting_redraws_only_what_changes(tmp_path):
+    ql = ql_with(span_ms=2.0, trigger="rise")
+    assert ql.enable_blitting()                         # Agg can blit
+    ql.update([tone(1000) * 0.5])
+    assert ql.refresh() is False                        # first time: full redraw
+    ql.fig.canvas.draw()                                # (what draw_idle leads to)
+    assert ql._background is not None
+    ql.update([tone(1000) * 0.5])
+    assert ql.refresh() is True                         # then fast blits
+    ql.set_span_ms(5.0)                                 # new time axis: full redraw
+    ql.update([tone(1000) * 0.5])
+    assert ql.refresh() is False
+    # a saved image still has the traces (animated artists are normally left out)
+    with_data, empty = tmp_path / "a.png", tmp_path / "b.png"
+    ql.fig.savefig(with_data, dpi=40)
+    ql.line_i.set_visible(False), ql.line_q.set_visible(False), ql.line_spec.set_visible(False)
+    ql.fig.savefig(empty, dpi=40)
+    assert with_data.read_bytes() != empty.read_bytes()
+    assert ql.line_i.get_animated()                     # back to fast mode after saving
+
+
+def test_pacer_keeps_redrawing_to_half_the_time():
+    class Timer:
+        interval = 30
+    p = pq.RedrawPacer(30)
+    p.timer = Timer()
+    p.frame_started(); p.t0 -= 0.010; p.drawn()         # a 10 ms frame: no change
+    assert p.timer.interval == 30
+    for _ in range(30):                                 # 120 ms frames
+        p.frame_started(); p.t0 -= 0.120; p.drawn()
+    assert p.timer.interval == pytest.approx(240, rel=0.05)
+    p.drawn()                                           # a control's redraw isn't timed
+    assert p.timer.interval == pytest.approx(240, rel=0.05)
