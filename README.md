@@ -147,6 +147,30 @@ pyquicklook --swap-iq
 pyquicklook --no-iq-balance
 ```
 
+### Ethernet stream (UDP)
+
+`--udp` replaces the sound card with a UDP listener, like
+`collect_data_complex.m`:
+
+```bash
+# Defaults match collect_data_complex.m: port 25344, fs = 100e6/(32*64)
+pyquicklook --udp
+
+# Everything can be changed
+pyquicklook --udp --port 25344 --fs 48828.125 --resolution 10 --packet-samples 256
+```
+
+Each packet is a little-endian int16 sequence number followed by interleaved
+int16 **I, Q** samples (`--packet-samples` complex samples, 256 by default, so
+1026 bytes). Samples are scaled by 1/32768, so the plots are in dBFS like the
+sound-card modes. Blocks are cut from the continuous stream (block length is
+`fs / resolution`, not tied to packet boundaries) and shown with the same time
+plot controls, spectrum and waterfall. The sequence number is used to count
+lost packets (reported on exit); wrong-sized packets are ignored, and a
+warning appears if nothing arrives for a few seconds. `--device`, `--file` and
+the microphone notes don't apply to the UDP source; `--swap-iq` and
+`--no-iq-balance` still do.
+
 ### Looking closely at the time plot
 
 The two rows of controls under the time plot work like a scope's front panel:
