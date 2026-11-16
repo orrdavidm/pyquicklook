@@ -420,3 +420,83 @@ def test_pacer_keeps_redrawing_to_half_the_time():
     assert p.timer.interval == pytest.approx(240, rel=0.05)
     p.drawn()                                           # a control's redraw isn't timed
     assert p.timer.interval == pytest.approx(240, rel=0.05)
+
+
+# ---- UDP (Ethernet) source ---------------------------------------------------
+def _udp_packet(seq, i, q):
+    iq = np.column_stack([i, q]).astype("<i2")
+    return np.int16(seq).astype("<i2").tobytes() + iq.tobytes()
+
+
+def _wait_blocks(src, count, timeout=3.0):
+    import time
+    blocks, t_end = [], time.monotonic() + timeout
+    while len(blocks) < count and time.monotonic() < t_end:
+        blocks += src.poll()
+        time.sleep(0.01)
+    return blocks
+
+
+def test_udp_source_blocks_and_iq_order():
+    import socket
+    n_pkt, n_blk = 256, 512
+    src = pq.UdpSource(0, 48828.125, n_blk, n_pkt)       # port 0: any free port
+    port = src.sock.getsockname()[1]
+    src.start()
+    try:
+        tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        for seq in range(2):
+            tx.sendto(_udp_packet(seq, np.full(n_pkt, 16384), np.full(n_pkt, -8192)),
+                      ("127.0.0.1", port))
+        blocks = _wait_blocks(src, 1)
+    finally:
+        src.stop()
+    assert len(blocks) == 1 and blocks[0].shape == (n_blk, 2)
+    # columns are (Q, I): I = +0.5 full scale, Q = -0.25
+    assert np.allclose(blocks[0][:, 1], 0.5) and np.allclose(blocks[0][:, 0], -0.25)
+    assert src.missed == 0
+
+
+def test_udp_counts_missed_packets_and_wraparound():
+    import socket
+    src = pq.UdpSource(0, 48828.125, 256, 256)
+    port = src.sock.getsockname()[1]
+    src.start()
+    try:
+        tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        z = np.zeros(256)
+        for seq in (32766, 32767, -32768, -32767, -32764):   # last one skips 2
+            tx.sendto(_udp_packet(seq, z, z), ("127.0.0.1", port))
+        _wait_blocks(src, 5)
+    finally:
+        src.stop()
+    assert src.packets == 5 and src.missed == 2
+
+
+def test_udp_tone_peaks_at_right_frequency():
+    import socket
+    fs, n_pkt = pq.UDP_FS, 256
+    n = pq._block_size(fs, 100)
+    src = pq.UdpSource(0, fs, n, n_pkt)
+    port = src.sock.getsockname()[1]
+    src.start()
+    try:
+        tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        f = -5000.0
+        t = np.arange(n_pkt * 4) / fs
+        i, q = 20000 * np.cos(2 * np.pi * f * t), 20000 * np.sin(2 * np.pi * f * t)
+        for k in range(4):
+            sl = slice(k * n_pkt, (k + 1) * n_pkt)
+            tx.sendto(_udp_packet(k, i[sl], q[sl]), ("127.0.0.1", port))
+        blocks = _wait_blocks(src, 1)
+    finally:
+        src.stop()
+    _d, spec, _s = pq.process_block(blocks[0], np.hanning(n))
+    f_pk, _db = peak(spec, fs, n)
+    assert abs(f_pk - f) <= fs / n
+
+
+def test_cli_udp_defaults():
+    args = pq._parse_args(["--udp"])
+    assert args.fs == pq.UDP_FS and args.port == 25344
+    assert pq._parse_args([]).fs == 48000

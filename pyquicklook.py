@@ -11,6 +11,10 @@ playback path) and shown as:
                     strongest bin labelled
   * Waterfall     - spectrum history, sharing the spectrum's frequency axis
 
+With ``--udp`` the same plots are driven by an Ethernet stream instead of a
+sound card, like ``collect_data_complex.m``: UDP packets with a 2-byte sequence
+number followed by interleaved int16 I, Q samples.
+
 A one-channel device (e.g. a laptop microphone) or mono .wav also works.  A
 real signal has the same content at +f and -f, so it gets a one-sided
 (0 .. fs/2) spectrum instead, and a warning says so.
@@ -38,7 +42,9 @@ import argparse
 import platform
 import queue
 import re
+import socket
 import sys
+import threading
 import time
 
 import matplotlib.pyplot as plt
@@ -48,6 +54,10 @@ from matplotlib.widgets import Button, Slider, TextBox
 DB_FLOOR = -140.0  # dBFS value used in place of log(0)
 WATERFALL_MAX_COLS = 512   # wider spectra are max-pooled so narrow tones stay visible
 SILENCE_WARN_S = 2.0       # this long of exact digital zeros means no input at all
+UDP_PORT = 25344           # default UDP port, as in collect_data_complex.m
+UDP_FS = 100e6 / (32 * 64)  # default UDP sample rate: 48828.125 Hz
+UDP_PACKET_SAMPLES = 256   # complex (I, Q) samples per UDP packet
+UDP_NO_DATA_S = 3.0        # warn if no packet has arrived after this long
 MIN_SPAN = 16              # narrowest time-plot span, in samples
 PRETRIGGER = 0.1           # fraction of the time-plot span shown before the trigger
 TRIGGER_HYSTERESIS = 0.05  # of the signal's peak-to-peak: noise rejection
@@ -288,6 +298,110 @@ class LiveSource:
                 blocks.append(self.q.get_nowait())
             except queue.Empty:
                 return blocks
+
+
+class UdpSource:
+    """Blocks from an Ethernet stream, like ``collect_data_complex.m``.
+
+    Each UDP packet is a little-endian int16 sequence number followed by
+    ``packet_samples`` interleaved (I, Q) int16 pairs.  Samples are scaled to
+    +-1 full scale (int16 / 32768) and cut into ``block_size``-sample blocks,
+    independent of packet boundaries, in the same (Q, I) column order as the
+    sound-card sources.  A receiver thread queues every block, so the plot
+    sees each one exactly once.
+    """
+
+    mono = False
+
+    def __init__(self, port, fs, block_size, packet_samples=UDP_PACKET_SAMPLES,
+                 max_queued=64):
+        self.port = port
+        self.fs = fs
+        self.block_size = block_size
+        self.packet_samples = packet_samples
+        self.packet_bytes = 2 + 4 * packet_samples
+        self.q = queue.Queue(maxsize=max_queued)
+        self.dropped = 0          # blocks dropped because plotting fell behind
+        self.missed = 0           # packets lost on the network (sequence gaps)
+        self.packets = 0
+        self.bad_size = 0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._t0 = None
+        self._warned = False
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1_000_000)
+            self.sock.bind(("", port))
+        except OSError as e:
+            self.sock.close()
+            raise RuntimeError(f"cannot listen on UDP port {port}: {e}") from e
+        self.sock.settimeout(0.2)
+
+    def start(self):
+        self._t0 = time.monotonic()
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=2)
+        self.sock.close()
+
+    def _queue(self, block):
+        try:
+            self.q.put_nowait(block)
+        except queue.Full:
+            self.dropped += 1
+            try:
+                self.q.get_nowait()
+                self.q.put_nowait(block)
+            except (queue.Empty, queue.Full):
+                pass
+
+    def _run(self):
+        pending = np.empty((0, 2), dtype=np.float32)
+        last_seq = None
+        while not self._stop.is_set():
+            try:
+                data = self.sock.recv(65536)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if len(data) != self.packet_bytes:
+                self.bad_size += 1
+                continue
+            self.packets += 1
+            seq = int(np.frombuffer(data, dtype="<i2", count=1)[0])
+            # The counter wraps at 16 bits; a reset to 0 is not a loss.
+            if last_seq is not None and seq != 0:
+                self.missed += (seq - last_seq - 1) % 65536
+            last_seq = seq
+            iq = np.frombuffer(data, dtype="<i2", offset=2).reshape(-1, 2)
+            # columns: (Q, I), like the stereo sources
+            pending = np.concatenate([pending, iq[:, ::-1].astype(np.float32) / 32768])
+            while len(pending) >= self.block_size:
+                self._queue(pending[:self.block_size].astype(np.float64))
+                pending = pending[self.block_size:]
+
+    def poll(self):
+        blocks = []
+        while True:
+            try:
+                blocks.append(self.q.get_nowait())
+            except queue.Empty:
+                break
+        if (not blocks and not self._warned and self.packets == 0 and self._t0
+                and time.monotonic() - self._t0 > UDP_NO_DATA_S):
+            self._warned = True
+            hint = (f"; {self.bad_size} packets had the wrong size (expected "
+                    f"{self.packet_bytes} bytes, see --packet-samples)"
+                    if self.bad_size else "")
+            print(f"Warning: no packets received on UDP port {self.port} yet{hint}",
+                  file=sys.stderr)
+        return blocks
 
 
 class FileSource:
@@ -817,8 +931,17 @@ def _parse_args(argv=None):
     p = argparse.ArgumentParser(
         description="Real-time I/Q quicklook (Python port of quicklook_complex.m)"
     )
-    p.add_argument("--fs", type=float, default=48000,
-                   help="sample rate in Hz (default: 48000; ignored with --file)")
+    p.add_argument("--fs", type=float, default=None,
+                   help="sample rate in Hz (default: 48000, or 48828.125 with --udp; "
+                        "ignored with --file)")
+    p.add_argument("--udp", action="store_true",
+                   help="listen for an Ethernet stream (like collect_data_complex.m) "
+                        "instead of using a sound card")
+    p.add_argument("--port", type=int, default=UDP_PORT,
+                   help=f"UDP port to listen on with --udp (default: {UDP_PORT})")
+    p.add_argument("--packet-samples", type=int, default=UDP_PACKET_SAMPLES,
+                   help="complex samples per UDP packet with --udp "
+                        f"(default: {UDP_PACKET_SAMPLES})")
     p.add_argument("--resolution", type=float, default=10,
                    help="FFT bin spacing in Hz; block length is fs/resolution (default: 10)")
     p.add_argument("--device", default=None,
@@ -853,7 +976,10 @@ def _parse_args(argv=None):
                         "plots to IMAGE (.png, .pdf, .svg) and exit")
     p.add_argument("--duration", type=float, default=3.0,
                    help="seconds to capture before saving with --save (default: 3)")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if args.fs is None:
+        args.fs = UDP_FS if args.udp else 48000
+    return args
 
 
 def _block_size(fs, resolution):
@@ -942,6 +1068,12 @@ def _check_gui(save):
 
 def _open_source(args):
     """The --file or sound-card source, with a warning if it is mono."""
+    if args.udp:
+        n = _block_size(args.fs, args.resolution)
+        source = UdpSource(args.port, args.fs, n, args.packet_samples)
+        print(f"Listening for UDP on port {args.port} at {args.fs:g} Hz "
+              f"({n} samples per block)")
+        return source
     if args.file:
         source = FileSource.from_wav(args.file, lambda fs: _block_size(fs, args.resolution))
         if source.fs != args.fs:
@@ -1009,7 +1141,7 @@ def _run(ql, source, args):
             pacer.t0 = None              # nothing new (or paused): nothing to time
         elif not args.save and ql.refresh():
             pacer.drawn()                # a blit is done now; a full redraw reports later
-        if ql.no_input and not warned:
+        if ql.no_input and not warned and not isinstance(source, UdpSource):
             warned.append(True)
             print(f"Warning: the input is all zeros; {_hint(SILENCE_HINT)}",
                   file=sys.stderr)
@@ -1035,8 +1167,11 @@ def _run(ql, source, args):
         pass
     finally:
         source.stop()
-        if isinstance(source, LiveSource) and source.dropped:
+        if isinstance(source, (LiveSource, UdpSource)) and source.dropped:
             print(f"Note: {source.dropped} blocks dropped because plotting fell behind",
+                  file=sys.stderr)
+        if isinstance(source, UdpSource) and source.missed:
+            print(f"Note: {source.missed} UDP packets missed (sequence gaps)",
                   file=sys.stderr)
 
 
