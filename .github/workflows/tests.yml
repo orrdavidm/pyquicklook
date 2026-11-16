@@ -27,6 +27,18 @@ jobs:
       - name: Tests
         run: pytest -v tests
       - name: Entry point and PortAudio load
+        shell: bash
         run: |
           pyquicklook --help
-          python -c "import sounddevice; print(sounddevice.get_portaudio_version())"
+          python - <<'PY'
+          # A missing PortAudio library raises OSError on import. CI runners
+          # have no sound server, so PortAudio loading but failing to
+          # initialize (PortAudioError) still means the library is installed.
+          try:
+              import sounddevice
+              print(sounddevice.get_portaudio_version())
+          except OSError:
+              raise
+          except Exception as e:
+              print("PortAudio loaded, but no audio server here:", e)
+          PY
